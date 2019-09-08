@@ -32,20 +32,18 @@ import requests
 import time
 import datetime
 import argparse
+import configparser
 from requests.adapters import HTTPAdapter
 from pprint import pprint
 from influxdb import InfluxDBClient
+from pathlib import Path
 
 # __version__ = '1.3.0'
 # __version_info__ = tuple([int(num) for num in __version__.split('.')])
 
-LOGIN = 'SensorPush login'
-PASSWD = 'SensorPush password'
-IFDB_IP = 'InfluxDP IP'
-IFDB_PORT = 'InfluxDP port'
-IFDB_USER = 'InfluxDP user'
-IFDB_PW = 'InfluxDB password'
-IFDB_DB = 'InfluxDP database'
+homedir = str(Path.home())
+
+CONFIGFILE = f'{homedir}/.sensorpush.conf'
 
 RETRYWAIT = 60
 MAXRETRY = 3
@@ -57,9 +55,36 @@ API_URL_GW = f'{API_URL_BASE}/devices/gateways'
 API_URL_SE = f'{API_URL_BASE}/devices/sensors'
 API_URL_SPL = f'{API_URL_BASE}/samples'
 
-
 HTTP_OA_HEAD = {'accept': 'application/json',
                 'Content-Type': 'application/json'}
+
+config = configparser.ConfigParser()
+
+if not Path(CONFIGFILE).is_file():
+    config['SONSORPUSHAPI'] = {
+        'LOGIN': 'SensorPush login',
+        'PASSWD': 'SensorPush password'
+    }
+    config['INFLUXDBCONF'] = {
+        'IFDB_IP': 'InfluxDP IP',
+        'IFDB_PORT': 'InfluxDP port',
+        'IFDB_USER': 'InfluxDP user',
+        'IFDB_PW': 'InfluxDB password',
+        'IFDB_DB': 'InfluxDP database'
+    }
+    with open(CONFIGFILE, 'w') as f:
+        config.write(f)
+else:
+    config.read(CONFIGFILE)
+
+LOGIN = config['SONSORPUSHAPI']['LOGIN']
+PASSWD = config['SONSORPUSHAPI']['PASSWD']
+IFDB_IP = config['INFLUXDBCONF']['IFDB_IP']
+IFDB_PORT = int(config['INFLUXDBCONF']['IFDB_PORT'])
+IFDB_USER = config['INFLUXDBCONF']['IFDB_USER']
+IFDB_PW = config['INFLUXDBCONF']['IFDB_PW']
+IFDB_DB = config['INFLUXDBCONF']['IFDB_DB']
+
 
 parser = argparse.ArgumentParser(
     description='Queries SensorPus API and stores the temp and humidity\
@@ -170,6 +195,7 @@ ifdbc = InfluxDBClient(host=IFDB_IP,
 # Try to get the proper UTC time offseet --------------------------------------
 mytz = datetime.timezone(datetime.timedelta(hours=local_time_offset()))
 currenttime = datetime.datetime.now(tz=mytz)
+querytime = currenttime
 
 if not starttime:
     starttime = currenttime - datetime.timedelta(minutes=int(backlog))
@@ -290,8 +316,10 @@ else:
     pprint(r)
     sys.exit()
 
-if listsensors:
-    for id in sensors.keys():
+measurement_v = []
+
+for id in sensors.keys():
+    if listsensors:
         # sensorname = sensors[id]["name"].encode('utf-8')
         sensorname = sensors[id]["name"]
         print(
@@ -325,8 +353,32 @@ if listsensors:
             {sensors[id]["calibration"]["temperature"]}')
         print('------------------------------------------------------------')
         print('')
+    
+    measurement_v.extend([
+        {
+            'measurement': 'SensorPush_V',
+            'tags': {
+                'sensor_id': sensors[id]["id"],
+                'sensor_name': sensors[id]["name"],
+            },
+            'fields': {
+                'voltage': sensors[id]["battery_voltage"]
+            },
+            'time': datetime.date.strftime(querytime, '%Y-%m-%dT%X.%z')
+        }
+    ])
 
+if listsensors:
     sys.exit(0)
+else:
+    if dryrun:
+        pprint(
+            '------------Data that would have been written---------')
+        pprint(measurement_v)
+        pprint(
+            '------------------------------------------------------')
+    else:
+        ifdbc.write_points(measurement_v)
 # names = [sensors[key]['name'] for key in sensors.keys()]
 
 # Get samples -----------------------------------------------------------------
@@ -397,7 +449,7 @@ for item in timelist:
                             },
                             'fields': {
                                 'temperature': celsius,
-                                'humidity': float(item['humidity']),
+                                'humidity': float(item['humidity'])
                             },
                             'time': item['observed']
                         }
