@@ -43,6 +43,7 @@ from pathlib import Path
 
 homedir = str(Path.home())
 
+
 CONFIGFILE = f'{homedir}/.sensorpush.conf'
 
 RETRYWAIT = 60
@@ -362,7 +363,7 @@ for id in sensors.keys():
                 'sensor_name': sensors[id]["name"],
             },
             'fields': {
-                'voltage': sensors[id]["battery_voltage"]
+                'voltage': float(sensors[id]["battery_voltage"])
             },
             'time': datetime.date.strftime(querytime, '%Y-%m-%dT%X.%z')
         }
