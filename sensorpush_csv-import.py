@@ -34,34 +34,69 @@ import json
 import time
 import datetime
 import argparse
+import configparser
 import math
 from pprint import pprint
 from influxdb import InfluxDBClient
+from pathlib import Path
 from itertools import zip_longest
+
 
 # __version__ = '1.1.1'
 # __version_info__ = tuple([int(num) for num in __version__.split('.')])
 
-IFDB_IP = 'InfluxDP IP'
-IFDB_PORT = 'InfluxDP port'
-IFDB_USER = 'InfluxDP user'
-IFDB_PW = 'InfluxDB password'
-IFDB_DB = 'InfluxDP database'
+homedir = str(Path.home())
+
+
+CONFIGFILE = f'{homedir}/.sensorpush.conf'
+
+config = configparser.ConfigParser()
+
+if not Path(CONFIGFILE).is_file():
+    config['INFLUXDBCONF'] = {
+        'IFDB_IP': 'InfluxDP IP',
+        'IFDB_PORT': 'InfluxDP port',
+        'IFDB_USER': 'InfluxDP user',
+        'IFDB_PW': 'InfluxDB password',
+        'IFDB_DB': 'InfluxDP database'
+    }
+    with open(CONFIGFILE, 'w') as f:
+        config.write(f)
+else:
+    config.read(CONFIGFILE)
+
+IFDB_IP = config['INFLUXDBCONF']['IFDB_IP']
+IFDB_PORT = int(config['INFLUXDBCONF']['IFDB_PORT'])
+IFDB_USER = config['INFLUXDBCONF']['IFDB_USER']
+IFDB_PW = config['INFLUXDBCONF']['IFDB_PW']
+IFDB_DB = config['INFLUXDBCONF']['IFDB_DB']
 
 parser = argparse.ArgumentParser(
     description='Reads a CSV file exported from the SensorPush Android App and\
     stores the temp and humidity readings in InfluxDB')
-parser.add_argument('-f', '--csvfile', dest='csvfile', default='', type=str,
-                    help='CSV file exported from the SensorPush Android App')
+parser.add_argument(
+    '-f',
+    '--csvfile',
+    dest='csvfile',
+    default='',
+    type=str,
+    required=True,
+    help='CSV file exported from the SensorPush Android App')
 parser.add_argument(
     '-s',
     '--sensorname',
     dest='sensorname',
     default='',
     type=str,
+    required=True,
     help='Sensor name')
-parser.add_argument('-i', '--sensorid', dest='sensorid', default='', type=str,
-                    help='Sensor id')
+parser.add_argument(
+    '-i', '--sensorid',
+    dest='sensorid',
+    default='',
+    type=str,
+    required=True,
+    help='Sensor id')
 parser.add_argument(
     '-d', '--dryrun', dest='dryrun', action="store_true",
     help='Do not write anything to InfluxDB -\
@@ -75,7 +110,6 @@ parser.add_argument(
     help='Write data in chunks to InfluxDB to not overload e.g. a RaspberryPi')
 args = parser.parse_args()
 
-
 csvfile = args.csvfile
 sensorname = args.sensorname
 sensorid = args.sensorid
@@ -83,11 +117,15 @@ dryrun = args.dryrun
 chunks = args.chunks
 
 if not sensorname:
-    sensorname = os.path.splitext(csvfile)[0]
+    print("You must specify a sensor name!")
+    sys.exit(0)
+    #sensorname = os.path.splitext(csvfile)[0]
 
 if not sensorid:
+    print("You must specify the sensor ID e.g.: 123456.123456789012345!")
+    sys.exit(0)
     # sensorid = str(uuid.uuid4())
-    sensorid = sensorname
+    #sensorid = sensorname
 
 
 def grouper(iterable, n, fillvalue=None):
