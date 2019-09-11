@@ -125,7 +125,7 @@ parser.add_argument(
     dest='qlimit',
     default='0',
     type=int,
-    help='Number of samples to return per sensor (default no limit)')
+    help='Number of samples to return per sensor (default unset = API default limimt [10])')
 parser.add_argument('-d',
                     '--delay',
                     dest='delay',
