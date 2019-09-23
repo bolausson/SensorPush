@@ -108,9 +108,9 @@ parser.add_argument(
     '-b',
     '--backlog',
     dest='backlog',
-    default='1440',
-    type=int,
-    help='Minutes back in time to fetch data (default 1440 minutes [24 h])')
+    default='1d',
+    type=str,
+    help='Historical data to fetch (default 1 day) - time can be specified in the format <number>[m|h|d|w|M|Y]. E.g.: 10 Minutes = 10m, 1 day = 1d, 1 month = 1M')
 parser.add_argument(
     '-t',
     '--timestep',
@@ -163,7 +163,6 @@ args = parser.parse_args()
 
 starttime = args.starttime
 stoptime = args.stoptime
-backlog = args.backlog
 timesteps = args.timestep
 qlimit = args.qlimit
 delay = args.delay
@@ -172,6 +171,11 @@ listgateways = args.listgateways
 sensorlist = args.sensorlist
 dryrun = args.dryrun
 
+backlogstring = args.backlog
+
+# Convert backlog to minutes
+minutes_per_unit = {"m": 1, "h": 60, "d": 60*24, "w": 60*24*7, "M": 60*24*30.417, "Y": 60*24*365}
+backlog = int(int(backlogstring[:-1]) * minutes_per_unit[backlogstring[-1]])
 
 def local_time_offset(t=None):
     """Return offset of local zone from GMT, either at present or at time t."""
