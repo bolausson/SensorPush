@@ -30,6 +30,7 @@ import sys
 import json
 import requests
 import time
+import math
 import datetime
 import argparse
 import configparser
@@ -55,6 +56,9 @@ API_URL_OA_ATOK = f'{API_URL_BASE}/oauth/accesstoken'
 API_URL_GW = f'{API_URL_BASE}/devices/gateways'
 API_URL_SE = f'{API_URL_BASE}/devices/sensors'
 API_URL_SPL = f'{API_URL_BASE}/samples'
+API_URL_RPL = f'{API_URL_BASE}/reports/list'
+API_URL_RPDL = f'{API_URL_BASE}/reports/download'
+
 
 HTTP_OA_HEAD = {'accept': 'application/json',
                 'Content-Type': 'application/json'}
@@ -189,6 +193,18 @@ def local_time_offset(t=None):
         return -time.timezone / 3600
 
 
+def ftoc(F):
+    C = float(round((F - 32) * 5.0 / 9.0,2))
+    return C
+
+def fttom(FT):
+    M = float(round(FT * 0.3048,2))
+    return M
+
+def inhgtombar(HG):
+    MBAR = float(round(HG * 33.8639,2))
+    return MBAR
+
 # Initiate the InfluxDB client ------------------------------------------------
 ifdbc = InfluxDBClient(host=IFDB_IP,
                        port=IFDB_PORT,
@@ -306,6 +322,26 @@ if listgateways:
         print('')
 
     sys.exit(0)
+
+
+# Get a list of bulk reports --------------------------------------------------
+pprint('Fetching the list of bulk reports')
+HTTP_DATA = json.dumps({})
+r = s.post(API_URL_RPL,
+           headers=HTTP_HEAD,
+           data=HTTP_DATA)
+
+if r.status_code == 200:
+    reports = json.loads(r.content.decode('utf-8'))
+else:
+    pprint('Could not fetch the list of bulk reports')
+    pprint(r)
+    sys.exit()
+
+if len(reports["files"]) > 0:
+    print("Bulk reports to download:")
+    for file in reports["files"]:
+        pprint(file)
 
 # Get a list of sensors -------------------------------------------------------
 pprint('Fetching the list of sensors')
@@ -441,10 +477,42 @@ for item in timelist:
             measurement = []
             for key in samples['sensors'].keys():
                 for item in samples['sensors'][key]:
-                    celsius = float(
-                        round(
-                            (item['temperature'] - 32) * 5.0 / 9.0,
-                            2))
+                    observed = item['observed']
+                    sensor_id = key
+                    sensor_name = sensors[key]['name']
+                    humidity = float(item['humidity'])
+                    temperature = ftoc(item['temperature'])
+                    
+                    try:
+                        pressure = inhgtombar(item['barometric_pressure'])
+                    except KeyError as e:
+                        pressure = ""
+                    else:
+                        abs_humidity = round(0.622 * humidity / 100 * (1.01325 * 10.0**(5.426651 - 2005.1 / (temperature + 273.15) + 0.00013869 * ((temperature + 273.15) * (temperature + 273.15) - 293700.0) / (temperature + 273.15) * (10.0**(0.000000000011965 * ((temperature + 273.15) * (temperature + 273.15) - 293700.0) * ((temperature + 273.15) * (temperature + 273.15) - 293700.0)) - 1.0) - 0.0044 * 10.0**((-0.0057148 * (374.11 - temperature)**1.25))) + (((temperature + 273.15) / 647.3) - 0.422) * (0.577 - ((temperature + 273.15) / 647.3)) * math.exp(0.000000000011965 * ((temperature + 273.15) * (temperature + 273.15) - 293700.0) * ((temperature + 273.15) * (temperature + 273.15) - 293700.0)) * 0.00980665) / (pressure / 1000.0 - humidity / 100.0 * (1.01325 * 10.0**(5.426651 - 2005.1 / (temperature + 273.15) + 0.00013869 * ((temperature + 273.15) * (temperature + 273.15) - 293700.0) / (temperature + 273.15) * (10.0**(0.000000000011965 * ((temperature + 273.15) * (temperature + 273.15) - 293700.0) * ((temperature + 273.15) * (temperature + 273.15) - 293700.0)) - 1.0) - 0.0044 * 10.0**((-0.0057148 * (374.11 - temperature)**1.25))) + (((temperature + 273.15) / 647.3) - 0.422) * (0.577 - ((temperature + 273.15) / 647.3)) * math.exp(0.000000000011965 * ((temperature + 273.15) * (temperature + 273.15) - 293700.0) * ((temperature + 273.15) * (temperature + 273.15) - 293700.0)) * 0.00980665)) * pressure/1000.0 * 100000000.0 / ((temperature + 273.15) * 287.1),2)
+                    
+                    try:
+                        altitude = fttom(item['altitude'])
+                    except KeyError as e:
+                        altitude = ""
+                        
+                    try:
+                        dewpoint = ftoc(item['dewpoint'])
+                    except KeyError as e:
+                        dewpoint = ""
+                        
+                    try:
+                        vpd = ftoc(item['vdp'])
+                    except KeyError as e:
+                        vpd = ""
+                    
+                    # Absolute humidity (g/m³)
+                    if pressure:
+                        # https://www.loxwiki.eu/display/LOX/Absolute+Luftfeuchtigkeit+berechnen
+                        abs_humidity = round(0.622 * humidity / 100 * (1.01325 * 10.0**(5.426651 - 2005.1 / (temperature + 273.15) + 0.00013869 * ((temperature + 273.15) * (temperature + 273.15) - 293700.0) / (temperature + 273.15) * (10.0**(0.000000000011965 * ((temperature + 273.15) * (temperature + 273.15) - 293700.0) * ((temperature + 273.15) * (temperature + 273.15) - 293700.0)) - 1.0) - 0.0044 * 10.0**((-0.0057148 * (374.11 - temperature)**1.25))) + (((temperature + 273.15) / 647.3) - 0.422) * (0.577 - ((temperature + 273.15) / 647.3)) * math.exp(0.000000000011965 * ((temperature + 273.15) * (temperature + 273.15) - 293700.0) * ((temperature + 273.15) * (temperature + 273.15) - 293700.0)) * 0.00980665) / (pressure / 1000.0 - humidity / 100.0 * (1.01325 * 10.0**(5.426651 - 2005.1 / (temperature + 273.15) + 0.00013869 * ((temperature + 273.15) * (temperature + 273.15) - 293700.0) / (temperature + 273.15) * (10.0**(0.000000000011965 * ((temperature + 273.15) * (temperature + 273.15) - 293700.0) * ((temperature + 273.15) * (temperature + 273.15) - 293700.0)) - 1.0) - 0.0044 * 10.0**((-0.0057148 * (374.11 - temperature)**1.25))) + (((temperature + 273.15) / 647.3) - 0.422) * (0.577 - ((temperature + 273.15) / 647.3)) * math.exp(0.000000000011965 * ((temperature + 273.15) * (temperature + 273.15) - 293700.0) * ((temperature + 273.15) * (temperature + 273.15) - 293700.0)) * 0.00980665)) * pressure/1000.0 * 100000000.0 / ((temperature + 273.15) * 287.1),2)
+                    else:
+                        # https://carnotcycle.wordpress.com/2012/08/04/how-to-convert-relative-humidity-to-absolute-humidity/
+                        abs_humidity = round((6.112 * math.e**((17.67 * temperature)/(temperature + 243.5)) * humidity * 2.1674) / (273.15 + temperature),2)
+
                     measurement.extend([
                         {
                             'measurement': 'SensorPush',
@@ -453,10 +521,15 @@ for item in timelist:
                                 'sensor_name': sensors[key]['name'],
                             },
                             'fields': {
-                                'temperature': celsius,
-                                'humidity': float(item['humidity'])
+                                'temperature': temperature,
+                                'humidity': humidity,
+                                'pressure': pressure,
+                                'altitude': altitude,
+                                'dewpoint': dewpoint,
+                                'vpd': vpd,
+                                'abs_humidity': abs_humidity
                             },
-                            'time': item['observed']
+                            'time': observed
                         }
                     ])
             # pprint(measurement)
