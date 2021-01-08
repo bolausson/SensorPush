@@ -44,7 +44,6 @@ from pathlib import Path
 
 homedir = str(Path.home())
 
-
 CONFIGFILE = f'{homedir}/.sensorpush.conf'
 
 RETRYWAIT = 60
@@ -77,6 +76,9 @@ if not Path(CONFIGFILE).is_file():
         'IFDB_PW': 'InfluxDB password',
         'IFDB_DB': 'InfluxDP database'
     }
+    config['MISC'] = {
+        'MY_ALTITUDE': 'Metres above sea level'
+    }
     with open(CONFIGFILE, 'w') as f:
         config.write(f)
 else:
@@ -89,7 +91,13 @@ IFDB_PORT = int(config['INFLUXDBCONF']['IFDB_PORT'])
 IFDB_USER = config['INFLUXDBCONF']['IFDB_USER']
 IFDB_PW = config['INFLUXDBCONF']['IFDB_PW']
 IFDB_DB = config['INFLUXDBCONF']['IFDB_DB']
+MY_ALTITUDE = config['MISC']['MY_ALTITUDE']
 
+try:
+    MY_ALTITUDE = float(MY_ALTITUDE)
+except ValueError as e:
+    print(f"MY_ALTITUDE is not set to a valid number: {MY_ALTITUDE}")
+    sys.exit()
 
 parser = argparse.ArgumentParser(
     description='Queries SensorPus API and stores the temp and humidity\
@@ -396,6 +404,9 @@ for id in sensors.keys():
         print(
             f'Calibration (temperature):\
             {sensors[id]["calibration"]["temperature"]}')
+        print(
+            f'RSSI                     :\
+            {sensors[id]["rssi"]}')
         print('------------------------------------------------------------')
         print('')
     
@@ -407,7 +418,8 @@ for id in sensors.keys():
                 'sensor_name': sensors[id]["name"],
             },
             'fields': {
-                'voltage': float(sensors[id]["battery_voltage"])
+                'voltage': float(sensors[id]["battery_voltage"]),
+                'rssi': float(sensors[id]["rssi"])
             },
             'time': datetime.date.strftime(querytime, '%Y-%m-%dT%X.%z')
         }
@@ -502,7 +514,7 @@ for item in timelist:
                     try:
                         altitude = fttom(item['altitude'])
                     except KeyError as e:
-                        altitude = ""
+                        altitude = MY_ALTITUDE
                         
                     try:
                         dewpoint = ftoc(item['dewpoint'])
