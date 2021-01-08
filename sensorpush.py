@@ -205,6 +205,10 @@ def inhgtombar(HG):
     MBAR = float(round(HG * 33.8639,2))
     return MBAR
 
+def pascaltombar(P):
+    MBAR = float(round(P / 100,2))
+    return MBAR
+
 # Initiate the InfluxDB client ------------------------------------------------
 ifdbc = InfluxDBClient(host=IFDB_IP,
                        port=IFDB_PORT,
@@ -487,9 +491,14 @@ for item in timelist:
                         pressure = inhgtombar(item['barometric_pressure'])
                     except KeyError as e:
                         pressure = ""
+                        # Absolute humidity (g/m³)
+                        # https://carnotcycle.wordpress.com/2012/08/04/how-to-convert-relative-humidity-to-absolute-humidity/
+                        abs_humidity = round((6.112 * math.e**((17.67 * temperature)/(temperature + 243.5)) * humidity * 2.1674) / (273.15 + temperature),2)
                     else:
+                        # Absolute humidity (g/m³)
+                        # https://www.loxwiki.eu/display/LOX/Absolute+Luftfeuchtigkeit+berechnen
                         abs_humidity = round(0.622 * humidity / 100 * (1.01325 * 10.0**(5.426651 - 2005.1 / (temperature + 273.15) + 0.00013869 * ((temperature + 273.15) * (temperature + 273.15) - 293700.0) / (temperature + 273.15) * (10.0**(0.000000000011965 * ((temperature + 273.15) * (temperature + 273.15) - 293700.0) * ((temperature + 273.15) * (temperature + 273.15) - 293700.0)) - 1.0) - 0.0044 * 10.0**((-0.0057148 * (374.11 - temperature)**1.25))) + (((temperature + 273.15) / 647.3) - 0.422) * (0.577 - ((temperature + 273.15) / 647.3)) * math.exp(0.000000000011965 * ((temperature + 273.15) * (temperature + 273.15) - 293700.0) * ((temperature + 273.15) * (temperature + 273.15) - 293700.0)) * 0.00980665) / (pressure / 1000.0 - humidity / 100.0 * (1.01325 * 10.0**(5.426651 - 2005.1 / (temperature + 273.15) + 0.00013869 * ((temperature + 273.15) * (temperature + 273.15) - 293700.0) / (temperature + 273.15) * (10.0**(0.000000000011965 * ((temperature + 273.15) * (temperature + 273.15) - 293700.0) * ((temperature + 273.15) * (temperature + 273.15) - 293700.0)) - 1.0) - 0.0044 * 10.0**((-0.0057148 * (374.11 - temperature)**1.25))) + (((temperature + 273.15) / 647.3) - 0.422) * (0.577 - ((temperature + 273.15) / 647.3)) * math.exp(0.000000000011965 * ((temperature + 273.15) * (temperature + 273.15) - 293700.0) * ((temperature + 273.15) * (temperature + 273.15) - 293700.0)) * 0.00980665)) * pressure/1000.0 * 100000000.0 / ((temperature + 273.15) * 287.1),2)
-                    
+
                     try:
                         altitude = fttom(item['altitude'])
                     except KeyError as e:
@@ -498,20 +507,15 @@ for item in timelist:
                     try:
                         dewpoint = ftoc(item['dewpoint'])
                     except KeyError as e:
-                        dewpoint = ""
+                        dewpoint = round((237.3 * ((math.log(humidity / 100) + ((17.27 * temperature) / (237.3 + temperature))) / 17.27)) / (1 - ((math.log(humidity / 100) + ((17.27 * temperature) / (237.3 + temperature))) / 17.27)),2)
                         
                     try:
                         vpd = ftoc(item['vdp'])
                     except KeyError as e:
-                        vpd = ""
-                    
-                    # Absolute humidity (g/m³)
-                    if pressure:
-                        # https://www.loxwiki.eu/display/LOX/Absolute+Luftfeuchtigkeit+berechnen
-                        abs_humidity = round(0.622 * humidity / 100 * (1.01325 * 10.0**(5.426651 - 2005.1 / (temperature + 273.15) + 0.00013869 * ((temperature + 273.15) * (temperature + 273.15) - 293700.0) / (temperature + 273.15) * (10.0**(0.000000000011965 * ((temperature + 273.15) * (temperature + 273.15) - 293700.0) * ((temperature + 273.15) * (temperature + 273.15) - 293700.0)) - 1.0) - 0.0044 * 10.0**((-0.0057148 * (374.11 - temperature)**1.25))) + (((temperature + 273.15) / 647.3) - 0.422) * (0.577 - ((temperature + 273.15) / 647.3)) * math.exp(0.000000000011965 * ((temperature + 273.15) * (temperature + 273.15) - 293700.0) * ((temperature + 273.15) * (temperature + 273.15) - 293700.0)) * 0.00980665) / (pressure / 1000.0 - humidity / 100.0 * (1.01325 * 10.0**(5.426651 - 2005.1 / (temperature + 273.15) + 0.00013869 * ((temperature + 273.15) * (temperature + 273.15) - 293700.0) / (temperature + 273.15) * (10.0**(0.000000000011965 * ((temperature + 273.15) * (temperature + 273.15) - 293700.0) * ((temperature + 273.15) * (temperature + 273.15) - 293700.0)) - 1.0) - 0.0044 * 10.0**((-0.0057148 * (374.11 - temperature)**1.25))) + (((temperature + 273.15) / 647.3) - 0.422) * (0.577 - ((temperature + 273.15) / 647.3)) * math.exp(0.000000000011965 * ((temperature + 273.15) * (temperature + 273.15) - 293700.0) * ((temperature + 273.15) * (temperature + 273.15) - 293700.0)) * 0.00980665)) * pressure/1000.0 * 100000000.0 / ((temperature + 273.15) * 287.1),2)
-                    else:
-                        # https://carnotcycle.wordpress.com/2012/08/04/how-to-convert-relative-humidity-to-absolute-humidity/
-                        abs_humidity = round((6.112 * math.e**((17.67 * temperature)/(temperature + 243.5)) * humidity * 2.1674) / (273.15 + temperature),2)
+                        # Vapor Pressure Deficit
+                        # https://pulsegrow.com/blogs/learn/vpd
+                        vpd = pascaltombar(((610.78 * math.e**(temperature / (temperature + 238.3) * 17.2694))) * (1 - humidity/100))
+                        #vpd = ""
 
                     measurement.extend([
                         {
