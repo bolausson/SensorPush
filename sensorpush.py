@@ -519,6 +519,8 @@ for item in timelist:
                     try:
                         dewpoint = ftoc(item['dewpoint'])
                     except KeyError as e:
+                        # Dewpoint in degree centigrate
+                        # https://cals.arizona.edu/azmet/dewpoint.html
                         dewpoint = round((237.3 * ((math.log(humidity / 100) + ((17.27 * temperature) / (237.3 + temperature))) / 17.27)) / (1 - ((math.log(humidity / 100) + ((17.27 * temperature) / (237.3 + temperature))) / 17.27)),2)
                         
                     try:
