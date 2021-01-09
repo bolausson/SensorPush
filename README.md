@@ -5,7 +5,7 @@ This Python 3 tool can query the API and save the temperature and humidity time 
 
 If you don't have an G1 WIFI Gateway and still want to plot your temperature, you can us another little tool I wrote to feed the CSV file which you can export via the Android App to InfluxDB.
 
-![Grafana](https://github.com/bolausson/SensorPush/blob/master/SensorPush-Grafan-InfluxDB.jpg?raw=true)
+![Grafana](https://github.com/bolausson/SensorPush/blob/master/SensorPush-Grafan-InfluxDB.png?raw=true)
 
 
 ## API query
