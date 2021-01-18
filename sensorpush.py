@@ -214,7 +214,7 @@ def inhgtombar(HG):
     return MBAR
 
 def pascaltombar(P):
-    MBAR = float(round(P / 100,2))
+    MBAR = float(round(P / 100,3))
     return MBAR
 
 # Initiate the InfluxDB client ------------------------------------------------
@@ -450,6 +450,8 @@ pprint('-------------------------------------------------------------------')
 iteration = 1
 retrycount = 0
 
+measures = ["altitude","barometric_pressure","dewpoint","humidity","temperature","vpd","distance"]
+
 for item in timelist:
     failed = True
 
@@ -457,7 +459,7 @@ for item in timelist:
         try:
             pprint(f'Iteration {iteration}/{iterations}')
 
-            query = {'startTime': item[0], 'stopTime': item[1]}
+            query = {'startTime': item[0], 'stopTime': item[1], 'measures': measures}
 
             if qlimit != 0:
                 query['limit'] = qlimit
@@ -515,7 +517,12 @@ for item in timelist:
                         altitude = fttom(item['altitude'])
                     except KeyError as e:
                         altitude = MY_ALTITUDE
-                        
+
+                    try:
+                        distance = fttom(item['distance'])
+                    except KeyError as e:
+                        distance = ""
+
                     try:
                         dewpoint = ftoc(item['dewpoint'])
                     except KeyError as e:
@@ -524,12 +531,11 @@ for item in timelist:
                         dewpoint = round((237.3 * ((math.log(humidity / 100) + ((17.27 * temperature) / (237.3 + temperature))) / 17.27)) / (1 - ((math.log(humidity / 100) + ((17.27 * temperature) / (237.3 + temperature))) / 17.27)),2)
                         
                     try:
-                        vpd = ftoc(item['vdp'])
+                        vpd = pascaltombar(item['vpd'])
                     except KeyError as e:
-                        # Vapor Pressure Deficit
+                        # Vapor Pressure Deficit in mBar
                         # https://pulsegrow.com/blogs/learn/vpd
-                        vpd = pascaltombar(((610.78 * math.e**(temperature / (temperature + 238.3) * 17.2694))) * (1 - humidity/100))
-                        #vpd = ""
+                        vpd = pascaltombar(((610.78 * math.e**(temperature / (temperature + 238.3) * 17.2694)) / 1000) * (1 - humidity/100))
 
                     measurement.extend([
                         {
@@ -550,7 +556,7 @@ for item in timelist:
                             'time': observed
                         }
                     ])
-            # pprint(measurement)
+
             if dryrun:
                 pprint(
                     '------------Data that would have been written---------')
