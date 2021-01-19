@@ -164,6 +164,12 @@ parser.add_argument(
     type=str,
     help='List of sensor IDs to query')
 parser.add_argument(
+    '-n',
+    '--noconvert',
+    dest='noconvert',
+    action='store_true',
+    help='Convert °F to °C, inHG to mBar, kPa to mBar and feet to meters')
+parser.add_argument(
     '-x',
     '--dryrun',
     dest='dryrun',
@@ -181,6 +187,7 @@ delay = args.delay
 listsensors = args.listsensors
 listgateways = args.listgateways
 sensorlist = args.sensorlist
+noconvert = args.noconvert
 dryrun = args.dryrun
 
 backlogstring = args.backlog
@@ -201,21 +208,33 @@ def local_time_offset(t=None):
         return -time.timezone / 3600
 
 
-def ftoc(F):
-    C = float(round((F - 32) * 5.0 / 9.0,2))
-    return C
+def F_to_C(F):
+    if noconvert:
+        return F
+    else:
+        C = float(round((F - 32) * 5.0 / 9.0,2))
+        return C
 
-def fttom(FT):
-    M = float(round(FT * 0.3048,2))
-    return M
+def ft_to_m(ft):
+    if noconvert:
+        return ft
+    else:
+        m = float(round(ft * 0.3048,2))
+        return m
 
-def inhgtombar(HG):
-    MBAR = float(round(HG * 33.8639,2))
-    return MBAR
+def inHg_to_mBar(inHg):
+    if noconvert:
+        return inHg
+    else:
+        mbar = float(round(inHg * 33.8639,2))
+        return mbar
 
-def pascaltombar(P):
-    MBAR = float(round(P / 100,3))
-    return MBAR
+def kPa_to_mBar(kPa):
+    if noconvert:
+        return kPa
+    else:
+        mBar = float(round(kPa * 10,2))
+        return mBar
 
 # Initiate the InfluxDB client ------------------------------------------------
 ifdbc = InfluxDBClient(host=IFDB_IP,
@@ -499,10 +518,10 @@ for item in timelist:
                     sensor_id = key
                     sensor_name = sensors[key]['name']
                     humidity = float(item['humidity'])
-                    temperature = ftoc(item['temperature'])
+                    temperature = F_to_C(item['temperature'])
                     
                     try:
-                        pressure = inhgtombar(item['barometric_pressure'])
+                        pressure = inHg_to_mBar(item['barometric_pressure'])
                     except KeyError as e:
                         pressure = ""
                         # Absolute humidity (g/m³)
@@ -514,28 +533,28 @@ for item in timelist:
                         abs_humidity = round(0.622 * humidity / 100 * (1.01325 * 10.0**(5.426651 - 2005.1 / (temperature + 273.15) + 0.00013869 * ((temperature + 273.15) * (temperature + 273.15) - 293700.0) / (temperature + 273.15) * (10.0**(0.000000000011965 * ((temperature + 273.15) * (temperature + 273.15) - 293700.0) * ((temperature + 273.15) * (temperature + 273.15) - 293700.0)) - 1.0) - 0.0044 * 10.0**((-0.0057148 * (374.11 - temperature)**1.25))) + (((temperature + 273.15) / 647.3) - 0.422) * (0.577 - ((temperature + 273.15) / 647.3)) * math.exp(0.000000000011965 * ((temperature + 273.15) * (temperature + 273.15) - 293700.0) * ((temperature + 273.15) * (temperature + 273.15) - 293700.0)) * 0.00980665) / (pressure / 1000.0 - humidity / 100.0 * (1.01325 * 10.0**(5.426651 - 2005.1 / (temperature + 273.15) + 0.00013869 * ((temperature + 273.15) * (temperature + 273.15) - 293700.0) / (temperature + 273.15) * (10.0**(0.000000000011965 * ((temperature + 273.15) * (temperature + 273.15) - 293700.0) * ((temperature + 273.15) * (temperature + 273.15) - 293700.0)) - 1.0) - 0.0044 * 10.0**((-0.0057148 * (374.11 - temperature)**1.25))) + (((temperature + 273.15) / 647.3) - 0.422) * (0.577 - ((temperature + 273.15) / 647.3)) * math.exp(0.000000000011965 * ((temperature + 273.15) * (temperature + 273.15) - 293700.0) * ((temperature + 273.15) * (temperature + 273.15) - 293700.0)) * 0.00980665)) * pressure/1000.0 * 100000000.0 / ((temperature + 273.15) * 287.1),2)
 
                     try:
-                        altitude = fttom(item['altitude'])
+                        altitude = ft_to_m(item['altitude'])
                     except KeyError as e:
                         altitude = MY_ALTITUDE
 
                     try:
-                        distance = fttom(item['distance'])
+                        distance = ft_to_m(item['distance'])
                     except KeyError as e:
                         distance = ""
 
                     try:
-                        dewpoint = ftoc(item['dewpoint'])
+                        dewpoint = F_to_C(item['dewpoint'])
                     except KeyError as e:
                         # Dewpoint in degree centigrate
                         # https://cals.arizona.edu/azmet/dewpoint.html
                         dewpoint = round((237.3 * ((math.log(humidity / 100) + ((17.27 * temperature) / (237.3 + temperature))) / 17.27)) / (1 - ((math.log(humidity / 100) + ((17.27 * temperature) / (237.3 + temperature))) / 17.27)),2)
                         
                     try:
-                        vpd = pascaltombar(item['vpd'])
+                        vpd = kPa_to_mBar(item['vpd'])
                     except KeyError as e:
                         # Vapor Pressure Deficit in mBar
                         # https://pulsegrow.com/blogs/learn/vpd
-                        vpd = pascaltombar(((610.78 * math.e**(temperature / (temperature + 238.3) * 17.2694)) / 1000) * (1 - humidity/100))
+                        vpd = kPa_to_mBar(((610.78 * math.e**(temperature / (temperature + 238.3) * 17.2694)) / 1000) * (1 - humidity/100))
 
                     measurement.extend([
                         {
