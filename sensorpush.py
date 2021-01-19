@@ -168,7 +168,7 @@ parser.add_argument(
     '--noconvert',
     dest='noconvert',
     action='store_true',
-    help='Convert °F to °C, inHG to mBar, kPa to mBar and feet to meters')
+    help='Do not Convert °F to °C, inHG to mBar, kPa to mBar and feet to meters')
 parser.add_argument(
     '-x',
     '--dryrun',
