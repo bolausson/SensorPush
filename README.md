@@ -39,7 +39,7 @@ optional arguments:
   -g, --listgateways    Show a list of gateways and exit
   -i SENSORLIST [SENSORLIST ...], --sensorlist SENSORLIST [SENSORLIST ...]
                         List of sensor IDs to query
-  -n, --noconvert       Don't convert °F to °C, inHG to mBar, kPa to mBar and feet
+  -n, --noconvert       Do not convert °F to °C, inHG to mBar, kPa to mBar and feet
                         to meters
   -x, --dryrun          Do not write anything to the database, just print what
                         would have been written
