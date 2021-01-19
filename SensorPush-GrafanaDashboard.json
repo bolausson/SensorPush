@@ -15,9 +15,16 @@
   "editable": true,
   "gnetId": null,
   "graphTooltip": 0,
-  "id": 19,
-  "iteration": 1610205931627,
-  "links": [],
+  "id": 3,
+  "iteration": 1611036422025,
+  "links": [
+    {
+      "icon": "external link",
+      "keepTime": false,
+      "tags": [],
+      "type": "dashboards"
+    }
+  ],
   "panels": [
     {
       "cacheTimeout": null,
@@ -73,7 +80,7 @@
         },
         "textMode": "auto"
       },
-      "pluginVersion": "7.3.6",
+      "pluginVersion": "7.3.7",
       "targets": [
         {
           "alias": "$tag_sensor_name",
@@ -111,7 +118,7 @@
       ],
       "timeFrom": null,
       "timeShift": null,
-      "title": "SensorPush - Temperature",
+      "title": "Temperature",
       "type": "stat"
     },
     {
@@ -160,7 +167,7 @@
         "alertThreshold": true
       },
       "percentage": false,
-      "pluginVersion": "7.3.6",
+      "pluginVersion": "7.3.7",
       "pointradius": 0.5,
       "points": false,
       "renderer": "flot",
@@ -307,7 +314,7 @@
         "alertThreshold": true
       },
       "percentage": false,
-      "pluginVersion": "7.3.6",
+      "pluginVersion": "7.3.7",
       "pointradius": 0.5,
       "points": false,
       "renderer": "flot",
@@ -453,7 +460,7 @@
         "alertThreshold": true
       },
       "percentage": false,
-      "pluginVersion": "7.3.6",
+      "pluginVersion": "7.3.7",
       "pointradius": 0.5,
       "points": false,
       "renderer": "flot",
@@ -658,7 +665,7 @@
         "alertThreshold": true
       },
       "percentage": false,
-      "pluginVersion": "7.3.6",
+      "pluginVersion": "7.3.7",
       "pointradius": 0.5,
       "points": false,
       "renderer": "flot",
@@ -765,6 +772,155 @@
       "dashLength": 10,
       "dashes": false,
       "datasource": null,
+      "decimals": 2,
+      "description": "Vapor Pressure Deficit",
+      "fieldConfig": {
+        "defaults": {
+          "custom": {}
+        },
+        "overrides": []
+      },
+      "fill": 0,
+      "fillGradient": 0,
+      "gridPos": {
+        "h": 10,
+        "w": 24,
+        "x": 0,
+        "y": 50
+      },
+      "hiddenSeries": false,
+      "id": 14,
+      "legend": {
+        "alignAsTable": true,
+        "avg": true,
+        "current": true,
+        "max": true,
+        "min": true,
+        "rightSide": true,
+        "show": true,
+        "sideWidth": 520,
+        "sort": "current",
+        "sortDesc": true,
+        "total": false,
+        "values": true
+      },
+      "lines": true,
+      "linewidth": 1,
+      "links": [],
+      "nullPointMode": "connected",
+      "options": {
+        "alertThreshold": true
+      },
+      "percentage": false,
+      "pluginVersion": "7.3.7",
+      "pointradius": 0.5,
+      "points": false,
+      "renderer": "flot",
+      "seriesOverrides": [],
+      "spaceLength": 10,
+      "stack": false,
+      "steppedLine": false,
+      "targets": [
+        {
+          "alias": "$tag_sensor_name",
+          "groupBy": [
+            {
+              "params": [
+                "$__interval"
+              ],
+              "type": "time"
+            },
+            {
+              "params": [
+                "sensor_name"
+              ],
+              "type": "tag"
+            },
+            {
+              "params": [
+                "null"
+              ],
+              "type": "fill"
+            }
+          ],
+          "measurement": "SensorPush",
+          "orderByTime": "ASC",
+          "policy": "default",
+          "query": "SELECT mean(\"vpd\") FROM \"SensorPush\" WHERE (\"sensor_name\" =~ /^$sensors$/) AND $timeFilter GROUP BY time($__interval), \"sensor_name\" fill(null)",
+          "rawQuery": false,
+          "refId": "A",
+          "resultFormat": "time_series",
+          "select": [
+            [
+              {
+                "params": [
+                  "vpd"
+                ],
+                "type": "field"
+              },
+              {
+                "params": [],
+                "type": "mean"
+              }
+            ]
+          ],
+          "tags": [
+            {
+              "key": "sensor_name",
+              "operator": "=~",
+              "value": "/^$sensors$/"
+            }
+          ]
+        }
+      ],
+      "thresholds": [],
+      "timeFrom": null,
+      "timeRegions": [],
+      "timeShift": null,
+      "title": "VPD",
+      "tooltip": {
+        "shared": true,
+        "sort": 0,
+        "value_type": "individual"
+      },
+      "type": "graph",
+      "xaxis": {
+        "buckets": null,
+        "mode": "time",
+        "name": null,
+        "show": true,
+        "values": []
+      },
+      "yaxes": [
+        {
+          "decimals": null,
+          "format": "pressurembar",
+          "label": "",
+          "logBase": 1,
+          "max": null,
+          "min": null,
+          "show": true
+        },
+        {
+          "format": "short",
+          "label": null,
+          "logBase": 1,
+          "max": null,
+          "min": null,
+          "show": false
+        }
+      ],
+      "yaxis": {
+        "align": false,
+        "alignLevel": null
+      }
+    },
+    {
+      "aliasColors": {},
+      "bars": false,
+      "dashLength": 10,
+      "dashes": false,
+      "datasource": null,
       "decimals": null,
       "description": "",
       "fieldConfig": {
@@ -779,7 +935,7 @@
         "h": 10,
         "w": 24,
         "x": 0,
-        "y": 50
+        "y": 60
       },
       "hiddenSeries": false,
       "id": 12,
@@ -805,7 +961,7 @@
         "alertThreshold": true
       },
       "percentage": false,
-      "pluginVersion": "7.3.6",
+      "pluginVersion": "7.3.7",
       "pointradius": 0.5,
       "points": false,
       "renderer": "flot",
@@ -913,152 +1069,6 @@
       "dashLength": 10,
       "dashes": false,
       "datasource": null,
-      "decimals": 0,
-      "description": "",
-      "fieldConfig": {
-        "defaults": {
-          "custom": {}
-        },
-        "overrides": []
-      },
-      "fill": 0,
-      "fillGradient": 0,
-      "gridPos": {
-        "h": 10,
-        "w": 24,
-        "x": 0,
-        "y": 60
-      },
-      "hiddenSeries": false,
-      "id": 13,
-      "legend": {
-        "alignAsTable": true,
-        "avg": true,
-        "current": true,
-        "max": true,
-        "min": true,
-        "rightSide": true,
-        "show": true,
-        "sideWidth": 520,
-        "total": false,
-        "values": true
-      },
-      "lines": true,
-      "linewidth": 1,
-      "links": [],
-      "nullPointMode": "connected",
-      "options": {
-        "alertThreshold": true
-      },
-      "percentage": false,
-      "pluginVersion": "7.3.6",
-      "pointradius": 0.5,
-      "points": false,
-      "renderer": "flot",
-      "seriesOverrides": [],
-      "spaceLength": 10,
-      "stack": false,
-      "steppedLine": false,
-      "targets": [
-        {
-          "alias": "$tag_sensor_name",
-          "groupBy": [
-            {
-              "params": [
-                "$__interval"
-              ],
-              "type": "time"
-            },
-            {
-              "params": [
-                "sensor_name"
-              ],
-              "type": "tag"
-            },
-            {
-              "params": [
-                "null"
-              ],
-              "type": "fill"
-            }
-          ],
-          "measurement": "SensorPush_V",
-          "orderByTime": "ASC",
-          "policy": "default",
-          "refId": "A",
-          "resultFormat": "time_series",
-          "select": [
-            [
-              {
-                "params": [
-                  "rssi"
-                ],
-                "type": "field"
-              },
-              {
-                "params": [],
-                "type": "mean"
-              }
-            ]
-          ],
-          "tags": [
-            {
-              "key": "sensor_name",
-              "operator": "=~",
-              "value": "/^$sensors$/"
-            }
-          ]
-        }
-      ],
-      "thresholds": [],
-      "timeFrom": null,
-      "timeRegions": [],
-      "timeShift": null,
-      "title": "RSSI",
-      "tooltip": {
-        "shared": true,
-        "sort": 0,
-        "value_type": "individual"
-      },
-      "type": "graph",
-      "xaxis": {
-        "buckets": null,
-        "mode": "time",
-        "name": null,
-        "show": true,
-        "values": []
-      },
-      "yaxes": [
-        {
-          "decimals": 0,
-          "format": "dBm",
-          "label": "",
-          "logBase": 1,
-          "max": null,
-          "min": null,
-          "show": true
-        },
-        {
-          "format": "short",
-          "label": null,
-          "logBase": 1,
-          "max": null,
-          "min": null,
-          "show": false
-        }
-      ],
-      "yaxis": {
-        "align": false,
-        "alignLevel": null
-      }
-    },
-    {
-      "aliasColors": {},
-      "bars": false,
-      "cacheTimeout": null,
-      "dashLength": 10,
-      "dashes": false,
-      "datasource": null,
       "decimals": 2,
       "description": "This plot shows always the last Voltage value which has been reported to the cloud!",
       "fieldConfig": {
@@ -1070,7 +1080,7 @@
       "fill": 0,
       "fillGradient": 0,
       "gridPos": {
-        "h": 10,
+        "h": 11,
         "w": 24,
         "x": 0,
         "y": 70
@@ -1097,7 +1107,7 @@
         "alertThreshold": true
       },
       "percentage": false,
-      "pluginVersion": "7.3.6",
+      "pluginVersion": "7.3.7",
       "pointradius": 0.5,
       "points": false,
       "renderer": "flot",
@@ -1197,9 +1207,155 @@
         "align": false,
         "alignLevel": null
       }
+    },
+    {
+      "aliasColors": {},
+      "bars": false,
+      "cacheTimeout": null,
+      "dashLength": 10,
+      "dashes": false,
+      "datasource": null,
+      "decimals": 0,
+      "description": "",
+      "fieldConfig": {
+        "defaults": {
+          "custom": {}
+        },
+        "overrides": []
+      },
+      "fill": 0,
+      "fillGradient": 0,
+      "gridPos": {
+        "h": 11,
+        "w": 24,
+        "x": 0,
+        "y": 81
+      },
+      "hiddenSeries": false,
+      "id": 13,
+      "legend": {
+        "alignAsTable": true,
+        "avg": true,
+        "current": true,
+        "max": true,
+        "min": true,
+        "rightSide": true,
+        "show": true,
+        "sideWidth": 520,
+        "total": false,
+        "values": true
+      },
+      "lines": true,
+      "linewidth": 1,
+      "links": [],
+      "nullPointMode": "connected",
+      "options": {
+        "alertThreshold": true
+      },
+      "percentage": false,
+      "pluginVersion": "7.3.7",
+      "pointradius": 0.5,
+      "points": false,
+      "renderer": "flot",
+      "seriesOverrides": [],
+      "spaceLength": 10,
+      "stack": false,
+      "steppedLine": false,
+      "targets": [
+        {
+          "alias": "$tag_sensor_name",
+          "groupBy": [
+            {
+              "params": [
+                "$__interval"
+              ],
+              "type": "time"
+            },
+            {
+              "params": [
+                "sensor_name"
+              ],
+              "type": "tag"
+            },
+            {
+              "params": [
+                "null"
+              ],
+              "type": "fill"
+            }
+          ],
+          "measurement": "SensorPush_V",
+          "orderByTime": "ASC",
+          "policy": "default",
+          "refId": "A",
+          "resultFormat": "time_series",
+          "select": [
+            [
+              {
+                "params": [
+                  "rssi"
+                ],
+                "type": "field"
+              },
+              {
+                "params": [],
+                "type": "mean"
+              }
+            ]
+          ],
+          "tags": [
+            {
+              "key": "sensor_name",
+              "operator": "=~",
+              "value": "/^$sensors$/"
+            }
+          ]
+        }
+      ],
+      "thresholds": [],
+      "timeFrom": null,
+      "timeRegions": [],
+      "timeShift": null,
+      "title": "RSSI",
+      "tooltip": {
+        "shared": true,
+        "sort": 0,
+        "value_type": "individual"
+      },
+      "type": "graph",
+      "xaxis": {
+        "buckets": null,
+        "mode": "time",
+        "name": null,
+        "show": true,
+        "values": []
+      },
+      "yaxes": [
+        {
+          "decimals": 0,
+          "format": "dBm",
+          "label": "",
+          "logBase": 1,
+          "max": null,
+          "min": null,
+          "show": true
+        },
+        {
+          "format": "short",
+          "label": null,
+          "logBase": 1,
+          "max": null,
+          "min": null,
+          "show": false
+        }
+      ],
+      "yaxis": {
+        "align": false,
+        "alignLevel": null
+      }
     }
   ],
-  "refresh": "1m",
+  "refresh": false,
   "schemaVersion": 26,
   "style": "dark",
   "tags": [],
@@ -1221,7 +1377,7 @@
         "error": null,
         "hide": 0,
         "includeAll": true,
-        "label": "Sensors",
+        "label": null,
         "multi": true,
         "name": "sensors",
         "options": [],
@@ -1267,7 +1423,7 @@
     ]
   },
   "timezone": "",
-  "title": "SensorPush Sensors",
-  "uid": "6Q5c-PZgk",
-  "version": 5
+  "title": "SensorPush",
+  "uid": "nLTqwyRgk",
+  "version": 88
 }
