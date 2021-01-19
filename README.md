@@ -5,7 +5,7 @@ This Python 3 tool can query the API and save the temperature and humidity time 
 
 If you don't have an G1 WIFI Gateway and still want to plot your temperature, you can us another little tool I wrote to feed the CSV file which you can export via the Android App to InfluxDB.
 
-![Grafana](https://github.com/bolausson/SensorPush/blob/master/SensorPush-Grafan-InfluxDB.png?raw=true)
+![Grafana](https://github.com/bolausson/SensorPush/blob/master/SensorPush-Grafana-InfluxDB.png?raw=true)
 
 
 ## API query
@@ -13,7 +13,7 @@ If you don't have an G1 WIFI Gateway and still want to plot your temperature, yo
 # sensorpush.py --help
 usage: sensorpush.py [-h] [-s STARTTIME] [-p STOPTIME] [-b BACKLOG]
                      [-t TIMESTEP] [-q QLIMIT] [-d DELAY] [-l] [-g]
-                     [-i SENSORLIST [SENSORLIST ...]] [-x]
+                     [-i SENSORLIST [SENSORLIST ...]] [-n] [-x]
 
 Queries SensorPus API and stores the temp and humidity readings in InfluxDB
 
@@ -24,20 +24,23 @@ optional arguments:
   -p STOPTIME, --stop STOPTIME
                         Stop query at time (e.g. "2019-07-26T00:10:41+0200")
   -b BACKLOG, --backlog BACKLOG
-                        Minutes back in time to fetch data (default 1440
-                        minutes [24 h])
+                        Historical data to fetch (default 1 day) - time can be
+                        specified in the format <number>[m|h|d|w|M|Y]. E.g.:
+                        10 Minutes = 10m, 1 day = 1d, 1 month = 1M
   -t TIMESTEP, --timestep TIMESTEP
                         Time slice per query (in minutes) to fetch (default
                         720 minutes [12 h])
   -q QLIMIT, --querylimit QLIMIT
-                        Number of samples to return per sensor (default no
-                        limit)
+                        Number of samples to return per sensor (default unset
+                        = API default limimt [10])
   -d DELAY, --delay DELAY
                         Delay in seconds between queries
   -l, --listsensors     Show a list of sensors and exit
   -g, --listgateways    Show a list of gateways and exit
   -i SENSORLIST [SENSORLIST ...], --sensorlist SENSORLIST [SENSORLIST ...]
                         List of sensor IDs to query
+  -n, --noconvert       Don't convert °F to °C, inHG to mBar, kPa to mBar and feet
+                        to meters
   -x, --dryrun          Do not write anything to the database, just print what
                         would have been written
 ```                        
