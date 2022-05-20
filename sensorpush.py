@@ -28,19 +28,26 @@
 
 import sys
 import json
-import requests
 import time
 import math
+import requests
 import datetime
 import argparse
 import configparser
-from requests.adapters import HTTPAdapter
+from pathlib import Path
 from pprint import pprint
 from influxdb import InfluxDBClient
-from pathlib import Path
+from requests.adapters import HTTPAdapter
+from requests.packages.urllib3.exceptions import InsecureRequestWarning
 
-# __version__ = '1.3.0'
+# __version__ = '1.3.1'
 # __version_info__ = tuple([int(num) for num in __version__.split('.')])
+
+# Ignore SSL errors and suppress InsecureRequestWarning
+VERIFY_SSL=False
+
+if not VERIFY_SSL:
+    requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
 
 homedir = str(Path.home())
 
@@ -168,7 +175,7 @@ parser.add_argument(
     '--noconvert',
     dest='noconvert',
     action='store_true',
-    help='Do not Convert °F to °C, inHG to mBar, kPa to mBar and feet to meters')
+    help='Do not convert °F to °C, inHG to mBar, kPa to mBar and feet to meters')
 parser.add_argument(
     '-x',
     '--dryrun',
@@ -295,9 +302,11 @@ s.mount(API_URL_BASE, HTTPAdapter(max_retries=10))
 # get API oauth authorization string ------------------------------------------
 pprint('Fetching API oauth authorization string')
 HTTP_DATA = json.dumps({'email': LOGIN, 'password': PASSWD})
+
 r = s.post(API_URL_OA_AUTH,
            headers=HTTP_OA_HEAD,
-           data=HTTP_DATA)
+           data=HTTP_DATA,
+           verify=VERIFY_SSL)
 
 if r.status_code == 200:
     auth = r.content.decode('utf-8')
@@ -312,7 +321,8 @@ pprint('Fetching API oauth access token')
 HTTP_DATA = auth
 r = s.post(API_URL_OA_ATOK,
            headers=HTTP_OA_HEAD,
-           data=HTTP_DATA)
+           data=HTTP_DATA,
+           verify=VERIFY_SSL)
 
 if r.status_code == 200:
     atok = json.loads(r.content.decode('utf-8'))['accesstoken']
@@ -330,7 +340,8 @@ pprint('Fetching the list of gateways')
 HTTP_DATA = json.dumps({})
 r = s.post(API_URL_GW,
            headers=HTTP_HEAD,
-           data=HTTP_DATA)
+           data=HTTP_DATA,
+           verify=VERIFY_SSL)
 
 if r.status_code == 200:
     gateways = json.loads(r.content.decode('utf-8'))
@@ -360,7 +371,8 @@ pprint('Fetching the list of bulk reports')
 HTTP_DATA = json.dumps({})
 r = s.post(API_URL_RPL,
            headers=HTTP_HEAD,
-           data=HTTP_DATA)
+           data=HTTP_DATA,
+           verify=VERIFY_SSL)
 
 if r.status_code == 200:
     reports = json.loads(r.content.decode('utf-8'))
@@ -379,7 +391,8 @@ pprint('Fetching the list of sensors')
 HTTP_DATA = json.dumps({})
 r = s.post(API_URL_SE,
            headers=HTTP_HEAD,
-           data=HTTP_DATA)
+           data=HTTP_DATA,
+           verify=VERIFY_SSL)
 
 if r.status_code == 200:
     sensors = json.loads(r.content.decode('utf-8'))
@@ -394,41 +407,29 @@ for id in sensors.keys():
     if listsensors:
         # sensorname = sensors[id]["name"].encode('utf-8')
         sensorname = sensors[id]["name"]
-        print(
-            f'---------------{sensorname}---------------')
-        print(
-            f'Id                       :\
-            {sensors[id]["id"]}')
-        print(
-            f'DevId                    :\
-            {sensors[id]["deviceId"]}')
-        print(
-            f'Address                  :\
-            {sensors[id]["address"]}')
-        print(
-            f'Active                   :\
-            {sensors[id]["active"]}')
-        print(
-            f'Battery voltage          :\
-            {sensors[id]["battery_voltage"]}')
-        print(
-            f'Alert (humidity)         :\
-            {sensors[id]["alerts"]["humidity"]["enabled"]}')
-        print(
-            f'Alert (temperature)      :\
-            {sensors[id]["alerts"]["temperature"]["enabled"]}')
-        print(
-            f'Calibration (humidity)   :\
-            {sensors[id]["calibration"]["humidity"]}')
-        print(
-            f'Calibration (temperature):\
-            {sensors[id]["calibration"]["temperature"]}')
-        print(
-            f'RSSI                     :\
-            {sensors[id]["rssi"]}')
+        print(f'---------------{sensorname}---------------')
+        
+        for key in sensors[id].keys():
+            print(f'{key}: {sensors[id][key]}')
+
+    try:
+        BatVolt = float(sensors[id]["battery_voltage"])
+    except KeyError as e:
+        if listsensors:
+            print(f'Failed to get battery_voltage for {sensors[id]["name"]}')
+        batvolt = 0
+
+    try:
+        RSSI = float(sensors[id]["rssi"])
+    except KeyError as e:
+        if listsensors:
+            print(f'Failed to get rssi for {sensors[id]["name"]}')
+        rssi = 0
+
+    if listsensors:
         print('------------------------------------------------------------')
         print('')
-    
+
     measurement_v.extend([
         {
             'measurement': 'SensorPush_V',
@@ -437,8 +438,8 @@ for id in sensors.keys():
                 'sensor_name': sensors[id]["name"],
             },
             'fields': {
-                'voltage': float(sensors[id]["battery_voltage"]),
-                'rssi': float(sensors[id]["rssi"])
+                'voltage': float(BatVolt),
+                'rssi': float(RSSI)
             },
             'time': datetime.date.strftime(querytime, '%Y-%m-%dT%X.%z')
         }
@@ -490,7 +491,8 @@ for item in timelist:
 
             r = s.post(API_URL_SPL,
                        headers=HTTP_HEAD,
-                       data=HTTP_DATA)
+                       data=HTTP_DATA,
+                       verify=VERIFY_SSL)
 
             if r.status_code == 200:
                 samples = json.loads(r.content.decode('utf-8'))
