@@ -219,7 +219,10 @@ def F_to_C(F):
     if noconvert:
         return F
     else:
-        C = float(round((F - 32) * 5.0 / 9.0,2))
+        try:
+            C = float(round((F - 32) * 5.0 / 9.0,2))
+        except TypeError as e:
+            C = 0.0
         return C
 
 def ft_to_m(ft):
