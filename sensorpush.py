@@ -51,7 +51,7 @@ if not VERIFY_SSL:
 
 homedir = str(Path.home())
 
-CONFIGFILE = f'{homedir}/.sensorpush.conf'
+CONFIGFILE = f'{homedir}/.sensorpush_legacy.conf'
 
 RETRYWAIT = 60
 MAXRETRY = 3
@@ -217,42 +217,38 @@ def local_time_offset(t=None):
 
 def F_to_C(F):
     if noconvert:
-        return F
+        return float(F)
     else:
-        try:
-            C = float(round((F - 32) * 5.0 / 9.0,2))
-        except TypeError as e:
-            C = 0.0
-        return C
+        C = round((F - 32) * 5.0 / 9.0,2)
+        return float(C)
 
 def ft_to_m(ft):
     if noconvert:
-        return ft
+        return float(ft)
     else:
-        m = float(round(ft * 0.3048,2))
-        return m
+        m = round(ft * 0.3048,2)
+        return float(m)
 
 def inHg_to_mBar(inHg):
     if noconvert:
-        return inHg
+        return float(inHg)
     else:
-        mbar = float(round(inHg * 33.8639,2))
-        return mbar
+        mbar = round(inHg * 33.8639,2)
+        return float(mbar)
 
 def kPa_to_mBar(kPa):
     if noconvert:
-        return kPa
+        return float(kPa)
     else:
-        mBar = float(round(kPa * 10,2))
-        return mBar
+        mBar = round(kPa * 10,2)
+        return float(mBar)
 
 # Initiate the InfluxDB client ------------------------------------------------
 ifdbc = InfluxDBClient(host=IFDB_IP,
                        port=IFDB_PORT,
                        username=IFDB_USER,
                        password=IFDB_PW,
-                       database=IFDB_DB)
-
+                       database=IFDB_DB,)
 
 # Try to get the proper UTC time offseet --------------------------------------
 mytz = datetime.timezone(datetime.timedelta(hours=local_time_offset()))
@@ -518,68 +514,110 @@ for item in timelist:
             # Push data to influxdb -------------------------------------------
             measurement = []
             for key in samples['sensors'].keys():
+                fields = {}
                 for item in samples['sensors'][key]:
                     observed = item['observed']
                     sensor_id = key
                     sensor_name = sensors[key]['name']
-                    humidity = float(item['humidity'])
-                    temperature = F_to_C(item['temperature'])
+                    
+                    try:
+                        humidity = float(item['humidity'])
+                    except KeyError as e:
+                        pprint('Humidity not reported by API!')
+                        pprint(f'Setting humidity to None')
+                    else:
+                        fields["humidity"] = humidity
+                    
+                    try:
+                        temperature = F_to_C(item['temperature'])
+                    except Exception as e:
+                        pprint('Temperature not reported by API!')
+                    else:
+                        fields["temperature"] = temperature
                     
                     try:
                         pressure = inHg_to_mBar(item['barometric_pressure'])
-                    except KeyError as e:
-                        pressure = ""
+                    except Exception as e:
+                        if dryrun:
+                            pprint('Pressure not reported by API!')
+                            pprint(f'Estimating absolute humidity')
                         # Absolute humidity (g/m³)
                         # https://carnotcycle.wordpress.com/2012/08/04/how-to-convert-relative-humidity-to-absolute-humidity/
-                        abs_humidity = round((6.112 * math.e**((17.67 * temperature)/(temperature + 243.5)) * humidity * 2.1674) / (273.15 + temperature),2)
+                        abs_humidity = float(round((6.112 * math.e**((17.67 * temperature)/(temperature + 243.5)) * humidity * 2.1674) / (273.15 + temperature),2))
+                        fields["abs_humidity"] = abs_humidity
                     else:
+                        fields["pressure"] = pressure
+                        if dryrun:
+                            pprint(f'Pressure {pressure} reported by API')
+                            pprint('calculating absolute humidity based on reported pressure)')
                         # Absolute humidity (g/m³)
                         # https://www.loxwiki.eu/display/LOX/Absolute+Luftfeuchtigkeit+berechnen
-                        abs_humidity = round(0.622 * humidity / 100 * (1.01325 * 10.0**(5.426651 - 2005.1 / (temperature + 273.15) + 0.00013869 * ((temperature + 273.15) * (temperature + 273.15) - 293700.0) / (temperature + 273.15) * (10.0**(0.000000000011965 * ((temperature + 273.15) * (temperature + 273.15) - 293700.0) * ((temperature + 273.15) * (temperature + 273.15) - 293700.0)) - 1.0) - 0.0044 * 10.0**((-0.0057148 * (374.11 - temperature)**1.25))) + (((temperature + 273.15) / 647.3) - 0.422) * (0.577 - ((temperature + 273.15) / 647.3)) * math.exp(0.000000000011965 * ((temperature + 273.15) * (temperature + 273.15) - 293700.0) * ((temperature + 273.15) * (temperature + 273.15) - 293700.0)) * 0.00980665) / (pressure / 1000.0 - humidity / 100.0 * (1.01325 * 10.0**(5.426651 - 2005.1 / (temperature + 273.15) + 0.00013869 * ((temperature + 273.15) * (temperature + 273.15) - 293700.0) / (temperature + 273.15) * (10.0**(0.000000000011965 * ((temperature + 273.15) * (temperature + 273.15) - 293700.0) * ((temperature + 273.15) * (temperature + 273.15) - 293700.0)) - 1.0) - 0.0044 * 10.0**((-0.0057148 * (374.11 - temperature)**1.25))) + (((temperature + 273.15) / 647.3) - 0.422) * (0.577 - ((temperature + 273.15) / 647.3)) * math.exp(0.000000000011965 * ((temperature + 273.15) * (temperature + 273.15) - 293700.0) * ((temperature + 273.15) * (temperature + 273.15) - 293700.0)) * 0.00980665)) * pressure/1000.0 * 100000000.0 / ((temperature + 273.15) * 287.1),2)
+                        abs_humidity = float(round(0.622 * humidity / 100 * (1.01325 * 10.0**(5.426651 - 2005.1 / (temperature + 273.15) + 0.00013869 * ((temperature + 273.15) * (temperature + 273.15) - 293700.0) / (temperature + 273.15) * (10.0**(0.000000000011965 * ((temperature + 273.15) * (temperature + 273.15) - 293700.0) * ((temperature + 273.15) * (temperature + 273.15) - 293700.0)) - 1.0) - 0.0044 * 10.0**((-0.0057148 * (374.11 - temperature)**1.25))) + (((temperature + 273.15) / 647.3) - 0.422) * (0.577 - ((temperature + 273.15) / 647.3)) * math.exp(0.000000000011965 * ((temperature + 273.15) * (temperature + 273.15) - 293700.0) * ((temperature + 273.15) * (temperature + 273.15) - 293700.0)) * 0.00980665) / (pressure / 1000.0 - humidity / 100.0 * (1.01325 * 10.0**(5.426651 - 2005.1 / (temperature + 273.15) + 0.00013869 * ((temperature + 273.15) * (temperature + 273.15) - 293700.0) / (temperature + 273.15) * (10.0**(0.000000000011965 * ((temperature + 273.15) * (temperature + 273.15) - 293700.0) * ((temperature + 273.15) * (temperature + 273.15) - 293700.0)) - 1.0) - 0.0044 * 10.0**((-0.0057148 * (374.11 - temperature)**1.25))) + (((temperature + 273.15) / 647.3) - 0.422) * (0.577 - ((temperature + 273.15) / 647.3)) * math.exp(0.000000000011965 * ((temperature + 273.15) * (temperature + 273.15) - 293700.0) * ((temperature + 273.15) * (temperature + 273.15) - 293700.0)) * 0.00980665)) * pressure/1000.0 * 100000000.0 / ((temperature + 273.15) * 287.1),2))
+                        fields["abs_humidity"] = abs_humidity
 
                     try:
-                        altitude = ft_to_m(item['altitude'])
-                    except KeyError as e:
-                        altitude = MY_ALTITUDE
+                        alti = float(item['altitude'])
+                    except Exception as e:
+                        if dryrun:
+                            pprint(f'No altitude provided by API!)')
+                            pprint(f'Setting altitude to custom altitude {MY_ALTITUDE} from config file')
+                        fields["altitude"] = float(MY_ALTITUDE)
+                    else:
+                        if dryrun:
+                            pprint(f'Altitude {alti} provided by API')
+                        if alti == 0:
+                            pprint(f'Altitude reported via API == {alti}')
+                            pprint(f'Setting altitude to custom altitude {MY_ALTITUDE} from config file')
+                            fields["altitude"] = float(MY_ALTITUDE)
+                        else:
+                            try:
+                                fields["altitude"] = ft_to_m(alti)
+                            except Exception as e:
+                                if dryrun:
+                                    pprint(f'Altitude {alti} failed to be processed! - Ignoring altitude field!')
+                                pass
 
                     try:
-                        distance = ft_to_m(item['distance'])
+                        fields["distance"] = ft_to_m(item['distance'])
                     except KeyError as e:
-                        distance = ""
+                        if dryrun:
+                            pprint('Distance not reported by API!')
+                    else:
+                        fields["distance"] = distance
 
                     try:
-                        dewpoint = F_to_C(item['dewpoint'])
+                        fields["dewpoint"] = F_to_C(item['dewpoint'])
                     except KeyError as e:
+                        if dryrun:
+                            pprint('Dewpoint not reported by API!')
+                            pprint('Calculating dewpoint!')
                         # Dewpoint in degree centigrate
                         # https://cals.arizona.edu/azmet/dewpoint.html
-                        dewpoint = round((237.3 * ((math.log(humidity / 100) + ((17.27 * temperature) / (237.3 + temperature))) / 17.27)) / (1 - ((math.log(humidity / 100) + ((17.27 * temperature) / (237.3 + temperature))) / 17.27)),2)
+                        fields["dewpoint"] = float(round((237.3 * ((math.log(humidity / 100) + ((17.27 * temperature) / (237.3 + temperature))) / 17.27)) / (1 - ((math.log(humidity / 100) + ((17.27 * temperature) / (237.3 + temperature))) / 17.27)),2))
+                        
                         
                     try:
-                        vpd = kPa_to_mBar(item['vpd'])
-                    except KeyError as e:
+                        fields["vpd"] = kPa_to_mBar(item['vpd'])
+                    except Exception as e:
+                        if dryrun:
+                            pprint('VPD not reported by API!')
+                            pprint('Calculating VPD!')
                         # Vapor Pressure Deficit in mBar
                         # https://pulsegrow.com/blogs/learn/vpd
-                        vpd = kPa_to_mBar(((610.78 * math.e**(temperature / (temperature + 238.3) * 17.2694)) / 1000) * (1 - humidity/100))
+                        fields["vpd"] = float(kPa_to_mBar(((610.78 * math.e**(temperature / (temperature + 238.3) * 17.2694)) / 1000) * (1 - humidity/100)))
 
-                    measurement.extend([
-                        {
+                    
+                    data = {
                             'measurement': 'SensorPush',
                             'tags': {
                                 'sensor_id': key,
                                 'sensor_name': sensors[key]['name'],
                             },
-                            'fields': {
-                                'temperature': temperature,
-                                'humidity': humidity,
-                                'pressure': pressure,
-                                'altitude': altitude,
-                                'dewpoint': dewpoint,
-                                'vpd': vpd,
-                                'abs_humidity': abs_humidity
-                            },
+                            'fields': fields,
                             'time': observed
                         }
-                    ])
+                    
+                    measurement.extend([data])
 
             if dryrun:
                 pprint(
