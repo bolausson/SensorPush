@@ -40,6 +40,7 @@ from requests.adapters import HTTPAdapter
 from influxdb_client import Point, InfluxDBClient
 from influxdb_client.client.write_api import SYNCHRONOUS
 from requests.packages.urllib3.exceptions import InsecureRequestWarning
+from requests.packages.urllib3.util.connection import allowed_gai_family
 
 # __version__ = '1.3.1'
 # __version_info__ = tuple([int(num) for num in __version__.split('.')])
@@ -106,6 +107,7 @@ IFDB_BUCKET = config['INFLUXDBCONF']['IFDB_BUCKET']
 
 
 MY_ALTITUDE = config['MISC']['MY_ALTITUDE']
+FORCE_IPv4 = config['MISC']['FORCE_IPv4']
 
 try:
     MY_ALTITUDE = float(MY_ALTITUDE)
@@ -300,19 +302,33 @@ while starttime <= stoptime:
 
     iterations = len(timelist)
 
-# Set retries for requests ----------------------------------------------------
+# Setup requests ----------------------------------------------------
 s = requests.Session()
 s.mount(API_URL_BASE, HTTPAdapter(max_retries=10))
 
-
 # get API oauth authorization string ------------------------------------------
-pprint('Fetching API oauth authorization string')
 HTTP_DATA = json.dumps({'email': LOGIN, 'password': PASSWD})
 
-r = s.post(API_URL_OA_AUTH,
-           headers=HTTP_OA_HEAD,
-           data=HTTP_DATA,
-           verify=VERIFY_SSL)
+trycount = 0
+while True:
+    trycount += 1
+    pprint(f'Fetching API oauth authorization string - try {trycount}/{MAXRETRY}')
+    try:
+        r = s.post(API_URL_OA_AUTH,
+                   headers=HTTP_OA_HEAD,
+                   data=HTTP_DATA,
+                   verify=VERIFY_SSL)
+    except requests.exceptions.ConnectionError as e:
+        #print(f'Failed to fetch API oauth authorization string - try {trycount}/{MAXRETRY} ', file=sys.stderr)
+        #print(f'Failed to fetch API oauth authorization string - try {trycount}/{MAXRETRY}')
+        time.sleep(20)
+    else:
+        break
+
+    if trycount >= MAXRETRY:
+        print(f'Failed to fetch API oauth authorization string - giving up after {trycount} attempts!', file=sys.stderr)
+        print(f'Failed to fetch API oauth authorization string - giving up after {trycount} attempts!')
+        sys.exit()
 
 if r.status_code == 200:
     auth = r.content.decode('utf-8')
