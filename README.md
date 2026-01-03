@@ -1,11 +1,33 @@
 # SensorPush
 [SensorPush](http://www.sensorpush.com/) recently introduced a [API](http://www.sensorpush.com/api/docs) to query the temperature and humidity samples recorded by their smart sensors via G1 WIFI GATEWAY - As long as the API is in beta stage, you have to contact support to get access!
 
-This Python 3 tool can query the API and save the temperature and humidity time series to InfluxDB so it can easily be plotted with Grafana.
+This Python 3 tool can query the API and save the temperature and humidity time series to a time series database so it can easily be plotted with Grafana.
 
-If you don't have an G1 WIFI Gateway and still want to plot your temperature, you can us another little tool I wrote to feed the CSV file which you can export via the Android App to InfluxDB.
+If you don't have an G1 WIFI Gateway and still want to plot your temperature, you can use another little tool I wrote to feed the CSV file which you can export via the Android App to InfluxDB.
 
 ![Grafana](https://github.com/bolausson/SensorPush/blob/master/SensorPush-Grafana-InfluxDB.png?raw=true)
+
+## Available Scripts
+
+There are three versions of the script for different database backends:
+
+| Script | Database | Description |
+|--------|----------|-------------|
+| `sensorpush.py` | InfluxDB 1.x | Original script for InfluxDB 1.x |
+| `sensorpush2.py` | InfluxDB 2.x | Updated script for InfluxDB 2.x with Flux query language |
+| `sensorpush_vm.py` | VictoriaMetrics | Script for VictoriaMetrics (Prometheus-compatible) |
+
+Each script has its own configuration file:
+- `~/.sensorpush.conf` - for InfluxDB 1.x
+- `~/.sensorpush2.conf` - for InfluxDB 2.x
+- `~/.sensorpush_vm.conf` - for VictoriaMetrics
+
+## Grafana Dashboards
+
+Example Grafana dashboards are included:
+- `SensorPush-vm-GrafanaDashboard.json` - Dashboard for VictoriaMetrics (Prometheus data source)
+
+For InfluxDB users, you can create similar dashboards using Flux queries.
 
 
 ## API query
