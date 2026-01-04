@@ -37,8 +37,7 @@ import configparser
 from pathlib import Path
 from pprint import pprint
 from requests.adapters import HTTPAdapter
-from influxdb_client import Point, InfluxDBClient
-from influxdb_client.client.write_api import SYNCHRONOUS
+# InfluxDB client is imported conditionally below (only when not in --dryrun or --help mode)
 from requests.packages.urllib3.exceptions import InsecureRequestWarning
 from requests.packages.urllib3.util.connection import allowed_gai_family
 
@@ -192,6 +191,12 @@ parser.add_argument(
     action='store_true',
     help='Do not write anything to the database,\
         just print what would have been written')
+parser.add_argument(
+    '-v',
+    '--verbose',
+    dest='verbose',
+    action='store_true',
+    help='Show full output in dryrun mode (do not truncate)')
 
 args = parser.parse_args()
 
@@ -205,6 +210,7 @@ listgateways = args.listgateways
 sensorlist = args.sensorlist
 noconvert = args.noconvert
 dryrun = args.dryrun
+verbose = args.verbose
 
 backlogstring = args.backlog
 
@@ -256,8 +262,14 @@ def kPa_to_mBar(kPa):
         return mBar
 
 # Initiate the InfluxDB client ------------------------------------------------
-ifdbc = InfluxDBClient(url=f'{IFDB_URL}:{IFDB_PORT}', token=IFDB_TOKEN, org=IFDB_ORG, verify_ssl=IFDB_VERIFY_SSL)
-ifdbc_write = ifdbc.write_api(write_options=SYNCHRONOUS)
+# Only import and initialize InfluxDB client when not in dryrun mode
+ifdbc = None
+ifdbc_write = None
+if not dryrun:
+    from influxdb_client import Point, InfluxDBClient
+    from influxdb_client.client.write_api import SYNCHRONOUS
+    ifdbc = InfluxDBClient(url=f'{IFDB_URL}:{IFDB_PORT}', token=IFDB_TOKEN, org=IFDB_ORG, verify_ssl=IFDB_VERIFY_SSL)
+    ifdbc_write = ifdbc.write_api(write_options=SYNCHRONOUS)
 
 # Try to get the proper UTC time offseet --------------------------------------
 mytz = datetime.timezone(datetime.timedelta(hours=local_time_offset()))

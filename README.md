@@ -64,7 +64,8 @@ optional arguments:
                         to meters
   -x, --dryrun          Do not write anything to the database, just print what
                         would have been written
-```                        
+  -v, --verbose         Show full output in dryrun mode (do not truncate)
+```
 
 ## CSV import
 ```

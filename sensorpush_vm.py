@@ -181,6 +181,12 @@ parser.add_argument(
     action='store_true',
     help='Do not write anything to the database,\
         just print what would have been written')
+parser.add_argument(
+    '-v',
+    '--verbose',
+    dest='verbose',
+    action='store_true',
+    help='Show full output in dryrun mode (do not truncate)')
 
 args = parser.parse_args()
 
@@ -194,6 +200,7 @@ listgateways = args.listgateways
 sensorlist = args.sensorlist
 noconvert = args.noconvert
 dryrun = args.dryrun
+verbose = args.verbose
 
 backlogstring = args.backlog
 
@@ -656,10 +663,14 @@ for item in timelist:
 
             if dryrun:
                 pprint('------------Data that would have been written---------')
-                for line in measurement_lines[:5]:  # Show first 5 lines as sample
-                    pprint(line)
-                if len(measurement_lines) > 5:
-                    pprint(f'... and {len(measurement_lines) - 5} more lines')
+                if verbose:
+                    for line in measurement_lines:
+                        pprint(line)
+                else:
+                    for line in measurement_lines[:5]:  # Show first 5 lines as sample
+                        pprint(line)
+                    if len(measurement_lines) > 5:
+                        pprint(f'... and {len(measurement_lines) - 5} more lines')
                 pprint('------------------------------------------------------')
             else:
                 write_to_victoriametrics(measurement_lines)
