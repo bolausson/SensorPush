@@ -67,6 +67,48 @@ optional arguments:
   -v, --verbose         Show full output in dryrun mode (do not truncate)
 ```
 
+## Migration from InfluxDB to VictoriaMetrics
+
+If you have existing SensorPush data in InfluxDB and want to migrate to VictoriaMetrics, use the `migrate_influx2vm.py` script:
+
+```
+# migrate_influx2vm.py --help
+usage: migrate_influx2vm.py [-h] [--ifdb-config IFDB_CONFIG] [--vm-config VM_CONFIG]
+                            [--start START_TIME] [--end END_TIME] [--all]
+                            [--batch-size BATCH_SIZE] [--chunk-days CHUNK_DAYS]
+                            [--dry-run] [--verbose]
+
+Migrate SensorPush data from InfluxDB 2.x to VictoriaMetrics
+
+optional arguments:
+  -h, --help            show this help message and exit
+  --ifdb-config IFDB_CONFIG
+                        Path to InfluxDB config file (default: ~/.sensorpush.conf)
+  --vm-config VM_CONFIG
+                        Path to VictoriaMetrics config file (default: ~/.sensorpush_vm.conf)
+  --start START_TIME    Start time (ISO format or relative like -7d)
+  --end END_TIME        End time (ISO format, default: now)
+  --all                 Migrate all data from earliest available
+  --batch-size BATCH_SIZE
+                        Batch size for writes (default: 10000)
+  --chunk-days CHUNK_DAYS
+                        Days per chunk for large migrations (default: 7)
+  --dry-run             Preview migration without writing data
+  --verbose             Show detailed output
+```
+
+Example usage:
+```bash
+# Migrate all historical data
+python migrate_influx2vm.py --all
+
+# Migrate last 30 days
+python migrate_influx2vm.py --start="2026-01-01T00:00:00Z"
+
+# Preview migration without writing
+python migrate_influx2vm.py --all --dry-run
+```
+
 ## CSV import
 ```
 # sensorpush_csv-import.py --help
