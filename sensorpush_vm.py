@@ -244,52 +244,8 @@ def kPa_to_mBar(kPa):
         mBar = float(round(kPa * 10,2))
         return mBar
 
-def escape_tag_value(value):
-    """Escape special characters in InfluxDB line protocol tag values."""
-    value = str(value)
-    value = value.replace(',', '\\,')
-    value = value.replace('=', '\\=')
-    value = value.replace(' ', '\\ ')
-    return value
-
-def escape_field_key(key):
-    """Escape special characters in InfluxDB line protocol field keys."""
-    key = str(key)
-    key = key.replace(',', '\\,')
-    key = key.replace('=', '\\=')
-    key = key.replace(' ', '\\ ')
-    return key
-
-def to_influx_line_protocol(measurement_name, tags, fields, timestamp):
-    """
-    Convert measurement data to InfluxDB line protocol format.
-
-    Format: measurement,tag1=value1,tag2=value2 field1=value1,field2=value2 timestamp
-    """
-    # Build tag set
-    tag_set = ','.join([f'{escape_tag_value(k)}={escape_tag_value(v)}' for k, v in tags.items()])
-
-    # Build field set
-    field_parts = []
-    for k, v in fields.items():
-        key = escape_field_key(k)
-        # Handle different field value types
-        if isinstance(v, bool):
-            field_parts.append(f'{key}={str(v).lower()}')
-        elif isinstance(v, int):
-            field_parts.append(f'{key}={v}i')
-        elif isinstance(v, float):
-            field_parts.append(f'{key}={v}')
-        elif isinstance(v, str):
-            # String values need to be quoted
-            field_parts.append(f'{key}="{v}"')
-        else:
-            field_parts.append(f'{key}={v}')
-
-    field_set = ','.join(field_parts)
-
-    # Convert timestamp to nanoseconds (InfluxDB line protocol expects nanoseconds)
-    # Parse ISO format timestamp
+def parse_timestamp_to_ms(timestamp):
+    """Convert timestamp to milliseconds for VictoriaMetrics JSON format."""
     if isinstance(timestamp, str):
         # Parse the timestamp string to datetime
         try:
@@ -297,31 +253,55 @@ def to_influx_line_protocol(measurement_name, tags, fields, timestamp):
         except:
             # Try alternative parsing
             dt = datetime.datetime.strptime(timestamp.split('.')[0], '%Y-%m-%dT%H:%M:%S')
-        timestamp_ns = int(dt.timestamp() * 1e9)
+        return int(dt.timestamp() * 1000)
     else:
-        timestamp_ns = int(timestamp * 1e9)
+        return int(timestamp * 1000)
 
-    # Construct line protocol
-    line = f'{measurement_name},{tag_set} {field_set} {timestamp_ns}'
-    return line
+
+def to_vm_json_lines(measurement_name, tags, fields, timestamp):
+    """
+    Convert measurement data to VictoriaMetrics native JSON format.
+
+    Returns a list of JSON lines, one per field (metric).
+    Format: {"metric":{"__name__":"measurement_field","tag1":"value1"},"values":[value],"timestamps":[ts_ms]}
+    """
+    timestamp_ms = parse_timestamp_to_ms(timestamp)
+    lines = []
+
+    for field_name, field_value in fields.items():
+        # Build metric with __name__ as measurement_fieldname
+        metric = {'__name__': f'{measurement_name}_{field_name}'}
+        # Add all tags as labels
+        for tag_key, tag_value in tags.items():
+            metric[tag_key] = str(tag_value)
+
+        # Create the JSON line
+        json_obj = {
+            'metric': metric,
+            'values': [float(field_value)],
+            'timestamps': [timestamp_ms]
+        }
+        lines.append(json.dumps(json_obj, ensure_ascii=False))
+
+    return lines
+
 
 def write_to_victoriametrics(lines):
-    """Write data to VictoriaMetrics using InfluxDB line protocol."""
+    """Write data to VictoriaMetrics using native JSON format."""
     if not lines:
         return
 
-    # Join all lines with newline
+    # Join all lines with newline (JSON Lines format)
     data = '\n'.join(lines)
 
-    # POST to VictoriaMetrics /write endpoint
-    url = f'{VM_URL}/write'
+    # POST to VictoriaMetrics /api/v1/import endpoint
+    url = f'{VM_URL}/api/v1/import'
 
     try:
-        # Encode data as UTF-8 to properly handle special characters (e.g., umlauts)
         response = requests.post(
             url,
             data=data.encode('utf-8'),
-            headers={'Content-Type': 'text/plain; charset=utf-8'},
+            headers={'Content-Type': 'application/json'},
             verify=VM_VERIFY_SSL
         )
         response.raise_for_status()
@@ -515,7 +495,7 @@ for id in sensors.keys():
         print('------------------------------------------------------------')
         print('')
 
-    # Convert to InfluxDB line protocol
+    # Convert to VictoriaMetrics JSON format
     tags = {
         'sensor_id': str(sensors[id]["id"]),
         'sensor_name': str(sensors[id]["name"])
@@ -526,8 +506,8 @@ for id in sensors.keys():
     }
     timestamp = datetime.date.strftime(querytime, '%Y-%m-%dT%X%z')
 
-    line = to_influx_line_protocol(measurement_v_name, tags, fields, timestamp)
-    measurement_v_lines.append(line)
+    lines = to_vm_json_lines(measurement_v_name, tags, fields, timestamp)
+    measurement_v_lines.extend(lines)
 
 if listsensors:
     sys.exit(0)
@@ -593,7 +573,7 @@ for item in timelist:
             pprint('Number of samples fetched: ' + str(numsamples))
             pprint('Number of sensors queried: ' + str(numsensosrs))
 
-            # Convert data to InfluxDB line protocol ----------------------------
+            # Convert data to VictoriaMetrics JSON format -------------------------
             measurement_lines = []
             for key in samples['sensors'].keys():
                 for item in samples['sensors'][key]:
@@ -670,9 +650,9 @@ for item in timelist:
                     finally:
                         fields['vpd'] = float(vpd)
 
-                    # Convert to InfluxDB line protocol
-                    line = to_influx_line_protocol(MEASUREMENT_NAME, tags, fields, observed)
-                    measurement_lines.append(line)
+                    # Convert to VictoriaMetrics JSON format
+                    lines = to_vm_json_lines(MEASUREMENT_NAME, tags, fields, observed)
+                    measurement_lines.extend(lines)
 
             if dryrun:
                 pprint('------------Data that would have been written---------')
