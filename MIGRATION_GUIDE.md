@@ -209,7 +209,7 @@ If you need to go back to InfluxDB:
 
 An example Grafana dashboard for VictoriaMetrics is included:
 
-- `SensorPush-vm-GrafanaDashboard.json` - Import this into Grafana with a Prometheus data source pointing to VictoriaMetrics
+- `SensorPush-GrafanaDashboard-vm.json` - Import this into Grafana with a Prometheus data source pointing to VictoriaMetrics
 
 ## Support
 

@@ -26,7 +26,7 @@ Each script has its own configuration file:
 
 Example Grafana dashboards are included:
 - `SensorPush-GrafanaDashboard.json` - Dashboard for InfluxDB
-- `SensorPush-vm-GrafanaDashboard.json` - Dashboard for VictoriaMetrics (Prometheus data source)
+- `SensorPush-GrafanaDashboard-vm.json` - Dashboard for VictoriaMetrics (Prometheus data source)
 
 
 ## API query
