@@ -1216,6 +1216,8 @@ class SensorPushDaemon:
                                  writer._consecutive_failures)
                 continue
             for sid in sensor_ids:
+                if not self.running:
+                    break
                 # sensor_id tag is stored as float(key), e.g. "1234567.0"
                 sid_tag = str(float(sid))
                 try:
@@ -1356,6 +1358,9 @@ class SensorPushDaemon:
         """Write records to all backends with retry and reconnection."""
         all_failed = True
         for writer in self.writers:
+            if not self.running:
+                return
+
             # If never connected or previously marked disconnected, try to connect
             if not writer.connected:
                 try:
@@ -1370,6 +1375,8 @@ class SensorPushDaemon:
                     continue  # skip this backend for this cycle
 
             for attempt, delay in enumerate([5, 10], 1):
+                if not self.running:
+                    return
                 try:
                     logger.debug("Writing %d records to %s (attempt %d)...",
                                  len(records), type(writer).__name__, attempt)
