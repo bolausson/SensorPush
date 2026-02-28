@@ -76,7 +76,6 @@ TYPE = victoriametrics
 [INFLUXDB2]
 MEASUREMENT_NAME = SensorPush
 URL = http://localhost:8086
-PORT = 8086
 TOKEN = your_token
 ORG = your_org
 BUCKET = sensorpush
@@ -84,9 +83,10 @@ VERIFY_SSL = False
 
 [INFLUXDB3]
 MEASUREMENT_NAME = SensorPush
-HOST = localhost:8181
+URL = http://localhost:8181
 DATABASE = sensorpush
 TOKEN = your_token
+VERIFY_SSL = False
 
 [VICTORIAMETRICS]
 MEASUREMENT_NAME = SensorPush

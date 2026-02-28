@@ -4,7 +4,7 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-Type=simple
+Type=notify
 # Adjust the ExecStart path and user to match your installation:
 ExecStart=/usr/bin/python3 /opt/sensorpush/sensorpushd.py --daemon --config /etc/sensorpushd.conf --log-level INFO
 # ExecStart=/usr/bin/python3 /home/youruser/github/SensorPush/sensorpushd.py --daemon --log-level INFO

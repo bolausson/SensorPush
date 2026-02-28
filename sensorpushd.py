@@ -36,6 +36,7 @@ import json
 import time
 import math
 import signal
+import socket
 import logging
 import requests
 import datetime
@@ -48,6 +49,26 @@ from requests.packages.urllib3.exceptions import InsecureRequestWarning
 
 # Suppress SSL warnings globally
 requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
+
+
+def sd_notify(state):
+    """Send a notification to the systemd watchdog (if available).
+
+    Uses the NOTIFY_SOCKET environment variable set by systemd for
+    Type=notify or WatchdogSec services.  Silently does nothing when
+    the socket is not available (e.g. running outside systemd).
+    """
+    sock_path = os.environ.get('NOTIFY_SOCKET')
+    if not sock_path:
+        return
+    try:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+        if sock_path.startswith('@'):
+            sock_path = '\0' + sock_path[1:]
+        sock.sendto(state.encode(), sock_path)
+        sock.close()
+    except Exception:
+        pass
 
 logger = logging.getLogger('sensorpushd')
 
@@ -123,6 +144,12 @@ def _load_legacy_influxdb2(config):
     """Load legacy ~/.sensorpush.conf format."""
     # Note: original config uses 'SONSORPUSHAPI' (typo preserved for compat)
     section = 'SONSORPUSHAPI' if 'SONSORPUSHAPI' in config else 'SENSORPUSHAPI'
+    # Legacy config has separate IFDB_URL and IFDB_PORT — combine into one URL
+    url = config['INFLUXDBCONF']['IFDB_URL']
+    port = config['INFLUXDBCONF']['IFDB_PORT']
+    host_part = url.split('://', 1)[-1]
+    if ':' not in host_part:
+        url = f'{url}:{port}'
     return {
         'login': config[section]['LOGIN'],
         'password': config[section]['PASSWD'],
@@ -131,8 +158,7 @@ def _load_legacy_influxdb2(config):
         'force_ipv4': config['MISC'].get('FORCE_IPv4', 'False').lower() in ('true', '1', 'yes'),
         'influxdb2': {
             'measurement_name': config['INFLUXDBCONF'].get('MEASUREMENT_NAME', 'SensorPush'),
-            'url': config['INFLUXDBCONF']['IFDB_URL'],
-            'port': int(config['INFLUXDBCONF']['IFDB_PORT']),
+            'url': url,
             'token': config['INFLUXDBCONF']['IFDB_TOKEN'],
             'org': config['INFLUXDBCONF']['IFDB_ORG'],
             'bucket': config['INFLUXDBCONF']['IFDB_BUCKET'],
@@ -174,9 +200,15 @@ def _load_unified(config):
     """Load new unified ~/.sensorpushd.conf format."""
     section = 'SONSORPUSHAPI' if 'SONSORPUSHAPI' in config else 'SENSORPUSHAPI'
 
+    # Accept both 'PASSWD' (legacy) and 'PASSWORD' (new) key names
+    if config.has_option(section, 'PASSWD'):
+        password = config[section]['PASSWD']
+    else:
+        password = config[section]['PASSWORD']
+
     cfg = {
-        'login': config[section]['LOGIN'],
-        'password': config[section]['PASSWD'],
+        'login': config.get(section, 'LOGIN', fallback=config.get(section, 'EMAIL', fallback='')),
+        'password': password,
         'backend': config.get('BACKEND', 'TYPE', fallback='victoriametrics'),
         'my_altitude': config.getfloat('MISC', 'MY_ALTITUDE', fallback=0.0),
         'force_ipv4': config.getboolean('MISC', 'FORCE_IPv4', fallback=False),
@@ -190,10 +222,16 @@ def _load_unified(config):
     }
 
     if 'INFLUXDB2' in config:
+        url = config.get('INFLUXDB2', 'URL', fallback='http://localhost:8086')
+        # Legacy compat: if PORT is set and URL doesn't already contain a port
+        if config.has_option('INFLUXDB2', 'PORT'):
+            port = config.get('INFLUXDB2', 'PORT')
+            host_part = url.split('://', 1)[-1]
+            if ':' not in host_part:
+                url = f'{url}:{port}'
         cfg['influxdb2'] = {
             'measurement_name': config.get('INFLUXDB2', 'MEASUREMENT_NAME', fallback='SensorPush'),
-            'url': config.get('INFLUXDB2', 'URL', fallback='http://localhost:8086'),
-            'port': config.getint('INFLUXDB2', 'PORT', fallback=8086),
+            'url': url,
             'token': config.get('INFLUXDB2', 'TOKEN', fallback=''),
             'org': config.get('INFLUXDB2', 'ORG', fallback=''),
             'bucket': config.get('INFLUXDB2', 'BUCKET', fallback='sensorpush'),
@@ -201,11 +239,17 @@ def _load_unified(config):
         }
 
     if 'INFLUXDB3' in config:
+        # Read URL (new) or HOST (legacy) for backward compat
+        if config.has_option('INFLUXDB3', 'URL'):
+            url = config.get('INFLUXDB3', 'URL')
+        else:
+            url = config.get('INFLUXDB3', 'HOST', fallback='http://localhost:8181')
         cfg['influxdb3'] = {
             'measurement_name': config.get('INFLUXDB3', 'MEASUREMENT_NAME', fallback='SensorPush'),
-            'host': config.get('INFLUXDB3', 'HOST', fallback='localhost:8181'),
+            'url': url,
             'database': config.get('INFLUXDB3', 'DATABASE', fallback='sensorpush'),
             'token': config.get('INFLUXDB3', 'TOKEN', fallback=''),
+            'verify_ssl': config.getboolean('INFLUXDB3', 'VERIFY_SSL', fallback=False),
         }
 
     if 'VICTORIAMETRICS' in config:
@@ -222,8 +266,8 @@ def create_default_config(path):
     """Write a default config template."""
     config = configparser.ConfigParser()
     config['SENSORPUSHAPI'] = {
-        'LOGIN': 'SensorPush login',
-        'PASSWD': 'SensorPush password',
+        'LOGIN': 'SensorPush login (email)',
+        'PASSWORD': 'SensorPush password',
     }
     config['BACKEND'] = {
         'TYPE': 'victoriametrics',
@@ -231,7 +275,6 @@ def create_default_config(path):
     config['INFLUXDB2'] = {
         'MEASUREMENT_NAME': 'SensorPush',
         'URL': 'http://localhost:8086',
-        'PORT': '8086',
         'TOKEN': 'your_influxdb2_token',
         'ORG': 'your_org',
         'BUCKET': 'sensorpush',
@@ -239,9 +282,10 @@ def create_default_config(path):
     }
     config['INFLUXDB3'] = {
         'MEASUREMENT_NAME': 'SensorPush',
-        'HOST': 'localhost:8181',
+        'URL': 'http://localhost:8181',
         'DATABASE': 'sensorpush',
         'TOKEN': 'your_influxdb3_token',
+        'VERIFY_SSL': 'False',
     }
     config['VICTORIAMETRICS'] = {
         'MEASUREMENT_NAME': 'SensorPush',
@@ -328,6 +372,11 @@ def parse_args():
     parser.add_argument(
         '--log-file', dest='logfile', default=None, type=str,
         help='Log to file instead of stderr')
+    parser.add_argument(
+        '--generate-config', dest='generate_config', nargs='?',
+        const='', default=None, metavar='PATH',
+        help='Generate a default config file and exit. '
+             'Optionally specify output path (default: ~/.sensorpushd.conf)')
     return parser.parse_args()
 
 
@@ -414,6 +463,14 @@ def parse_timestamp_to_ms(timestamp):
 class BaseWriter(ABC):
     """Abstract base class for database backend writers."""
 
+    def __init__(self):
+        self._connected = False
+        self._consecutive_failures = 0
+
+    @property
+    def connected(self):
+        return self._connected
+
     @abstractmethod
     def connect(self):
         """Establish connection to the backend."""
@@ -428,9 +485,11 @@ class BaseWriter(ABC):
         pass
 
     @abstractmethod
-    def get_last_timestamp(self, measurement_name):
+    def get_last_timestamp(self, measurement_name, sensor_id=None):
         """Query the backend for the most recent data point timestamp.
 
+        If sensor_id is given, returns the last timestamp for that
+        specific sensor (using the temperature metric as reference).
         Returns a datetime object or None if no data exists.
         """
         pass
@@ -440,13 +499,22 @@ class BaseWriter(ABC):
         """Close the backend connection."""
         pass
 
+    def reconnect(self):
+        """Tear down and re-establish the connection."""
+        try:
+            self.close()
+        except Exception:
+            pass
+        self._connected = False
+        self.connect()
+
 
 class InfluxDB2Writer(BaseWriter):
     """InfluxDB 2.x backend writer."""
 
     def __init__(self, config):
+        super().__init__()
         self.url = config['url']
-        self.port = config['port']
         self.token = config['token']
         self.org = config['org']
         self.bucket = config['bucket']
@@ -466,31 +534,34 @@ class InfluxDB2Writer(BaseWriter):
                 "Install with: pip install influxdb-client"
             )
         self.client = InfluxDBClient(
-            url=f'{self.url}:{self.port}',
+            url=self.url,
             token=self.token,
             org=self.org,
             verify_ssl=self.verify_ssl
         )
         self.write_api = self.client.write_api(write_options=SYNCHRONOUS)
         self.query_api = self.client.query_api()
-        logger.info("Connected to InfluxDB 2 at %s:%s", self.url, self.port)
+        self._connected = True
+        logger.info("Connected to InfluxDB 2 at %s", self.url)
 
     def write(self, records):
         if not records:
             return
         self.write_api.write(bucket=self.bucket, org=self.org, record=records)
 
-    def get_last_timestamp(self, measurement_name):
+    def get_last_timestamp(self, measurement_name, sensor_id=None):
         try:
-            # Use last() on a single field to minimize data read.
-            # last() is optimized in InfluxDB 2 to use the storage index
-            # rather than scanning all data points.
+            sensor_filter = ''
+            if sensor_id is not None:
+                sensor_filter = (
+                    f' |> filter(fn: (r) => r.sensor_id == "{sensor_id}")'
+                )
             query = (
                 f'from(bucket: "{self.bucket}")'
                 f' |> range(start: -30d)'
                 f' |> filter(fn: (r) => r._measurement == "{measurement_name}"'
                 f'    and r._field == "temperature")'
-                f' |> keep(columns: ["_time"])'
+                f'{sensor_filter}'
                 f' |> last()'
             )
             tables = self.query_api.query(query, org=self.org)
@@ -504,6 +575,10 @@ class InfluxDB2Writer(BaseWriter):
     def close(self):
         if self.client:
             self.client.close()
+            self.client = None
+            self.write_api = None
+            self.query_api = None
+            self._connected = False
             logger.info("InfluxDB 2 connection closed")
 
 
@@ -511,9 +586,11 @@ class InfluxDB3Writer(BaseWriter):
     """InfluxDB 3.x backend writer."""
 
     def __init__(self, config):
-        self.host = config['host']
+        super().__init__()
+        self.url = config['url']
         self.database = config['database']
         self.token = config['token']
+        self.verify_ssl = config.get('verify_ssl', False)
         self.measurement_name = config['measurement_name']
         self.client = None
 
@@ -527,26 +604,28 @@ class InfluxDB3Writer(BaseWriter):
             )
         wco = write_client_options(write_options=SYNCHRONOUS)
         self.client = InfluxDBClient3(
-            host=self.host,
+            host=self.url,
             database=self.database,
             token=self.token,
             write_client_options=wco
         )
-        logger.info("Connected to InfluxDB 3 at %s", self.host)
+        self._connected = True
+        logger.info("Connected to InfluxDB 3 at %s", self.url)
 
     def write(self, records):
         if not records:
             return
-        for record in records:
-            self.client.write(record=record)
+        self.client.write(record=records)
 
-    def get_last_timestamp(self, measurement_name):
+    def get_last_timestamp(self, measurement_name, sensor_id=None):
         try:
-            # Limit to last 30 days so the query planner can prune partitions.
-            # Only query the time column to minimize data transfer.
+            sensor_filter = ''
+            if sensor_id is not None:
+                sensor_filter = f" AND sensor_id = '{sensor_id}'"
             query = (
                 f'SELECT max(time) AS last_time FROM "{measurement_name}"'
                 f" WHERE time > now() - INTERVAL '30 days'"
+                f'{sensor_filter}'
             )
             result = self.client.query(query)
             if result and len(result) > 0:
@@ -560,6 +639,8 @@ class InfluxDB3Writer(BaseWriter):
     def close(self):
         if self.client:
             self.client.close()
+            self.client = None
+            self._connected = False
             logger.info("InfluxDB 3 connection closed")
 
 
@@ -567,6 +648,7 @@ class VMWriter(BaseWriter):
     """VictoriaMetrics backend writer using native JSON import API."""
 
     def __init__(self, config):
+        super().__init__()
         self.url = config['url']
         self.verify_ssl = config['verify_ssl']
         self.measurement_name = config['measurement_name']
@@ -574,6 +656,7 @@ class VMWriter(BaseWriter):
 
     def connect(self):
         self.session = requests.Session()
+        self._connected = True
         logger.info("VictoriaMetrics writer ready for %s", self.url)
 
     def write(self, records):
@@ -593,7 +676,8 @@ class VMWriter(BaseWriter):
             url,
             data=data.encode('utf-8'),
             headers={'Content-Type': 'application/json'},
-            verify=self.verify_ssl
+            verify=self.verify_ssl,
+            timeout=15
         )
         response.raise_for_status()
 
@@ -613,17 +697,19 @@ class VMWriter(BaseWriter):
             lines.append(json.dumps(json_obj, ensure_ascii=False))
         return lines
 
-    def get_last_timestamp(self, measurement_name):
+    def get_last_timestamp(self, measurement_name, sensor_id=None):
         try:
-            # Use MetricsQL tslast_over_time() to get the unix timestamp of
-            # the most recent raw sample. Returns a single value per series,
-            # no bulk data transfer. This is a VictoriaMetrics extension.
+            # Use last_over_time() which is standard MetricsQL.  The response
+            # timestamp in the [value] array tells us when the last point was.
+            sensor_filter = ''
+            if sensor_id is not None:
+                sensor_filter = f'sensor_id="{sensor_id}"'
             url = f'{self.url}/api/v1/query'
+            metric = f'{measurement_name}_temperature'
+            query_str = f'last_over_time({metric}{{{sensor_filter}}}[30d])'
             response = self.session.get(
                 url,
-                params={
-                    'query': f'tslast_over_time({measurement_name}_temperature[30d])',
-                },
+                params={'query': query_str},
                 verify=self.verify_ssl,
                 timeout=30
             )
@@ -631,8 +717,8 @@ class VMWriter(BaseWriter):
             data = response.json()
             results = data.get('data', {}).get('result', [])
             if results:
-                # The value is the unix timestamp of the last raw sample
-                ts = float(results[0]['value'][1])
+                # [0] = unix timestamp, [1] = value
+                ts = float(results[0]['value'][0])
                 return datetime.datetime.fromtimestamp(
                     ts, tz=datetime.timezone.utc)
             return None
@@ -643,6 +729,8 @@ class VMWriter(BaseWriter):
     def close(self):
         if self.session:
             self.session.close()
+            self.session = None
+            self._connected = False
             logger.info("VictoriaMetrics session closed")
 
 
@@ -962,10 +1050,16 @@ class SensorPushDaemon:
         return 'SensorPush'
 
     def _interruptible_sleep(self, seconds):
-        """Sleep that can be interrupted by signals."""
-        for _ in range(seconds):
+        """Sleep that can be interrupted by signals.
+
+        Sends a systemd watchdog ping every 60 seconds during sleep
+        so the WatchdogSec timer does not expire.
+        """
+        for i in range(seconds):
             if not self.running:
                 return
+            if i > 0 and i % 60 == 0:
+                sd_notify('WATCHDOG=1')
             time.sleep(1)
 
     def run(self):
@@ -976,10 +1070,13 @@ class SensorPushDaemon:
         # Connect to all backends (with retry)
         self._connect_writers()
 
+        sd_notify('READY=1')
+
         consecutive_failures = 0
         max_consecutive_failures = 50
 
         while self.running:
+            sd_notify('WATCHDOG=1')
             try:
                 self._collect_cycle()
                 consecutive_failures = 0
@@ -1005,14 +1102,17 @@ class SensorPushDaemon:
         logger.info("Daemon stopped")
 
     def _connect_writers(self):
-        """Connect all backend writers with retries. Fails only if ALL fail."""
+        """Connect all backend writers with retries. Fails only if ALL fail.
+
+        Backends that fail to connect are kept in self.writers with
+        _connected=False so that _safe_write() can attempt reconnection
+        on every subsequent cycle.
+        """
         failed = []
         for writer in self.writers:
-            connected = False
             for attempt, delay in enumerate(RETRY_DELAYS, 1):
                 try:
                     writer.connect()
-                    connected = True
                     break
                 except Exception as e:
                     logger.error("Failed to connect %s (attempt %d/%d): %s",
@@ -1021,14 +1121,15 @@ class SensorPushDaemon:
                     if attempt < len(RETRY_DELAYS):
                         logger.info("Retrying in %ds...", delay)
                         self._interruptible_sleep(delay)
-            if not connected:
+            if not writer.connected:
                 failed.append(type(writer).__name__)
         if len(failed) == len(self.writers):
             raise ConnectionError(
                 "Failed to connect to any backend: " + ', '.join(failed))
         if failed:
-            logger.warning("Some backends unavailable: %s. "
-                           "Writes will be retried.", ', '.join(failed))
+            logger.warning("Some backends unavailable at startup: %s. "
+                           "Will keep retrying on each cycle.",
+                           ', '.join(failed))
 
     def _collect_cycle(self):
         """One collection cycle: auth, fetch, process, write."""
@@ -1041,11 +1142,14 @@ class SensorPushDaemon:
 
         # Fetch and write voltage/RSSI data
         sensors = self.api.get_sensors()
+        logger.info("Building voltage records for %d sensors", len(sensors))
         voltage_records = build_voltage_records(
             sensors, measurement_name, currenttime)
         if self.args.dryrun:
             self._log_dryrun(voltage_records)
         else:
+            logger.info("Writing %d voltage records to backends",
+                        len(voltage_records))
             self._safe_write(voltage_records)
 
         # Fetch bulk reports (informational)
@@ -1060,7 +1164,7 @@ class SensorPushDaemon:
         # Determine time window (gap-filling in daemon mode)
         if self.args.daemon:
             starttime, stoptime = self._compute_daemon_window(
-                mytz, currenttime)
+                mytz, currenttime, sensors)
         else:
             starttime, stoptime = self._compute_oneshot_window(
                 mytz, currenttime)
@@ -1082,38 +1186,66 @@ class SensorPushDaemon:
             self._fetch_and_write_window(
                 window, i, iterations, sensors, measurement_name)
 
-    def _compute_daemon_window(self, mytz, currenttime):
-        """Compute time window for daemon mode with gap-filling."""
+    def _compute_daemon_window(self, mytz, currenttime, sensors):
+        """Compute time window for daemon mode with per-sensor gap-filling.
+
+        Checks each sensor individually on each backend (using the
+        temperature metric as reference) and picks the oldest timestamp
+        found.  This ensures that if a single sensor stops reporting,
+        the gap for that specific sensor is detected and back-filled.
+        """
         poll_backlog_str = self.config['daemon']['poll_backlog']
         poll_backlog_min = parse_backlog(poll_backlog_str)
 
-        # Get the oldest last-known timestamp across all backends
-        # so that every backend's gap gets filled
-        last_ts = None
-        for writer in self.writers:
-            try:
-                ts = writer.get_last_timestamp(writer.measurement_name)
-                if ts is not None:
-                    if last_ts is None or ts < last_ts:
-                        last_ts = ts
-            except Exception as e:
-                logger.warning("Could not query last timestamp from %s: %s",
-                               type(writer).__name__, e)
+        # Build sensor ID list (same IDs used as tags in records)
+        sensor_ids = list(sensors.keys())
 
-        if last_ts:
-            # Make timezone-aware if needed
-            if last_ts.tzinfo is None:
-                last_ts = last_ts.replace(tzinfo=datetime.timezone.utc)
-            last_ts_local = last_ts.astimezone(mytz)
-            gap_minutes = (currenttime - last_ts_local).total_seconds() / 60
+        # Find the oldest last-known timestamp across all sensors × backends
+        oldest_ts = None
+        oldest_info = None  # for logging: (sensor_id, writer_name)
+
+        for writer in self.writers:
+            if not writer.connected or writer._consecutive_failures > 0:
+                if not writer.connected:
+                    logger.debug("Skipping gap check on %s (not connected)",
+                                 type(writer).__name__)
+                else:
+                    logger.debug("Skipping gap check on %s "
+                                 "(%d consecutive write failures)",
+                                 type(writer).__name__,
+                                 writer._consecutive_failures)
+                continue
+            for sid in sensor_ids:
+                # sensor_id tag is stored as float(key), e.g. "1234567.0"
+                sid_tag = str(float(sid))
+                try:
+                    ts = writer.get_last_timestamp(
+                        writer.measurement_name, sensor_id=sid_tag)
+                    if ts is not None:
+                        if ts.tzinfo is None:
+                            ts = ts.replace(tzinfo=datetime.timezone.utc)
+                        if oldest_ts is None or ts < oldest_ts:
+                            oldest_ts = ts
+                            oldest_info = (sid, type(writer).__name__)
+                except Exception as e:
+                    logger.warning(
+                        "Could not query last timestamp for sensor %s "
+                        "from %s: %s", sid, type(writer).__name__, e)
+
+        if oldest_ts:
+            oldest_ts_local = oldest_ts.astimezone(mytz)
+            gap_minutes = (currenttime - oldest_ts_local).total_seconds() / 60
 
             if gap_minutes > poll_backlog_min:
+                sensor_name = sensors.get(
+                    oldest_info[0], {}).get('name', oldest_info[0])
                 logger.info(
-                    "Gap detected: oldest backend data at %s (%.0f min ago), "
-                    "fetching backlog",
-                    last_ts_local.strftime('%Y-%m-%dT%X%z'), gap_minutes)
-                # Fetch from 2 minutes before last known point
-                starttime = last_ts_local - datetime.timedelta(minutes=2)
+                    "Gap detected: sensor '%s' on %s last seen at %s "
+                    "(%.0f min ago), fetching with 1h safety margin",
+                    sensor_name, oldest_info[1],
+                    oldest_ts_local.strftime('%Y-%m-%dT%X%z'), gap_minutes)
+                # Go back 1 hour before the oldest data point as safety margin
+                starttime = oldest_ts_local - datetime.timedelta(hours=1)
             else:
                 starttime = currenttime - datetime.timedelta(
                     minutes=poll_backlog_min)
@@ -1150,10 +1282,17 @@ class SensorPushDaemon:
             try:
                 logger.info("Iteration %d/%d", iteration, iterations)
 
+                # The SensorPush API defaults to ~10 samples per sensor
+                # when no limit is specified.  In daemon mode we always
+                # want all available data, so use a high limit.
+                qlimit = self.args.qlimit
+                if qlimit == 0:
+                    qlimit = 10000
+
                 samples = self.api.get_samples(
                     window[0], window[1],
                     measures=MEASURES,
-                    limit=self.args.qlimit,
+                    limit=qlimit,
                     sensors=self.args.sensorlist
                 )
 
@@ -1214,22 +1353,54 @@ class SensorPushDaemon:
                 time.sleep(RETRYWAIT)
 
     def _safe_write(self, records):
-        """Write records to all backends with retry on failure."""
+        """Write records to all backends with retry and reconnection."""
         all_failed = True
         for writer in self.writers:
-            for attempt, delay in enumerate([10, 30, 60], 1):
+            # If never connected or previously marked disconnected, try to connect
+            if not writer.connected:
                 try:
+                    logger.info("Attempting to (re)connect %s...",
+                                type(writer).__name__)
+                    writer.reconnect()
+                    logger.info("Reconnected %s successfully",
+                                type(writer).__name__)
+                except Exception as e:
+                    logger.warning("Reconnect %s failed: %s",
+                                   type(writer).__name__, e)
+                    continue  # skip this backend for this cycle
+
+            for attempt, delay in enumerate([5, 10], 1):
+                try:
+                    logger.debug("Writing %d records to %s (attempt %d)...",
+                                 len(records), type(writer).__name__, attempt)
+                    t0 = time.time()
                     writer.write(records)
+                    logger.info("Write to %s OK (%d records, %.1fs)",
+                                type(writer).__name__, len(records),
+                                time.time() - t0)
+                    writer._consecutive_failures = 0
                     all_failed = False
                     break
                 except Exception as e:
-                    logger.error("Write to %s failed (attempt %d/3): %s",
-                                 type(writer).__name__, attempt, e)
-                    if attempt < 3:
+                    logger.error("Write to %s failed (attempt %d/2, %.1fs): %s",
+                                 type(writer).__name__, attempt,
+                                 time.time() - t0, e)
+                    if attempt < 2:
                         time.sleep(delay)
             else:
-                logger.error("Failed to write to %s after 3 attempts, "
-                             "skipping batch", type(writer).__name__)
+                writer._consecutive_failures += 1
+                logger.error("Failed to write to %s after 2 attempts "
+                             "(%d consecutive), skipping batch",
+                             type(writer).__name__,
+                             writer._consecutive_failures)
+                # After repeated failures, force reconnection on next cycle
+                if writer._consecutive_failures >= 3:
+                    logger.warning("Marking %s for reconnection after %d "
+                                   "consecutive failures",
+                                   type(writer).__name__,
+                                   writer._consecutive_failures)
+                    writer._connected = False
+
         if all_failed and not self.args.daemon:
             raise ConnectionError(
                 "Failed to write to any backend after 3 attempts")
@@ -1303,6 +1474,21 @@ def main():
 
     # Setup logging
     setup_logging(level=args.loglevel, log_file=args.logfile)
+
+    # Generate config and exit if requested
+    if args.generate_config is not None:
+        if args.generate_config:
+            path = args.generate_config
+        elif args.config:
+            path = args.config
+        else:
+            path = f'{Path.home()}/.sensorpushd.conf'
+        if Path(path).is_file():
+            print(f'Config file already exists at {path} — not overwriting.')
+            return 1
+        create_default_config(path)
+        print(f'Config template written to {path}')
+        return 0
 
     # Determine config file
     if args.config:
