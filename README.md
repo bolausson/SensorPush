@@ -9,7 +9,7 @@ If you don't have an G1 WIFI Gateway and still want to plot your temperature, yo
 
 ## sensorpushd.py - Unified Daemon (Recommended)
 
-`sensorpushd.py` is the unified replacement for the individual scripts. It supports **InfluxDB 2**, **InfluxDB 3**, and **VictoriaMetrics** in a single tool, and can run either as a one-shot command (for cron) or as a continuous daemon (managed by systemd).
+`sensorpushd.py` is the unified replacement for the individual scripts. It supports **InfluxDB 2**, **InfluxDB 3**, and **VictoriaMetrics** in a single tool — including writing to **multiple backends simultaneously**. It can run either as a one-shot command (for cron) or as a continuous daemon (managed by systemd).
 
 ### Installation
 
@@ -35,6 +35,9 @@ nano ~/.sensorpushd.conf
 # One-shot: fetch last day of data (backward compatible with cron)
 ./sensorpushd.py -b 1d --backend victoriametrics
 
+# Write to multiple backends simultaneously
+./sensorpushd.py -b 1d --backend victoriametrics influxdb3
+
 # Daemon mode: continuous polling every 5 minutes
 ./sensorpushd.py --daemon --interval 300
 
@@ -59,7 +62,7 @@ Your existing config files work directly:
 
 ### Configuration
 
-The new unified config file (`~/.sensorpushd.conf`) supports all backends. Only configure the section for the backend you use:
+The new unified config file (`~/.sensorpushd.conf`) supports all backends. Only configure the sections for the backend(s) you use. To write to multiple backends simultaneously, set `TYPE` to a comma-separated list:
 
 ```ini
 [SENSORPUSHAPI]
@@ -68,6 +71,7 @@ PASSWD = your_password
 
 [BACKEND]
 TYPE = victoriametrics
+# For multiple backends: TYPE = victoriametrics, influxdb3
 
 [INFLUXDB2]
 MEASUREMENT_NAME = SensorPush
@@ -116,6 +120,7 @@ sudo journalctl -u sensorpushd -f
 
 ### Daemon features
 
+- **Multi-backend**: Write to multiple databases simultaneously; each backend is independent — one failure does not block the others
 - **Gap-filling**: If the API or database was unavailable, the daemon automatically detects the gap on the next successful cycle and back-fills the missing data
 - **Graceful shutdown**: Responds to SIGTERM/SIGINT for clean shutdown
 - **Error recovery**: Retries with exponential backoff on API or backend failures; never exits on transient errors
@@ -132,7 +137,7 @@ All arguments from the old scripts are preserved (`-s`, `-p`, `-b`, `-t`, `-q`, 
 
 | Argument | Description |
 |----------|-------------|
-| `--backend` | `influxdb2`, `influxdb3`, or `victoriametrics` |
+| `--backend` | One or more of: `influxdb2`, `influxdb3`, `victoriametrics` |
 | `--daemon` | Run as a continuous daemon |
 | `--interval` | Polling interval in seconds (default: 300) |
 | `-c`/`--config` | Path to config file |

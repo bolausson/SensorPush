@@ -23,7 +23,8 @@
 #
 # Unified SensorPush daemon - queries the SensorPush API and stores
 # temperature, humidity, and other sensor readings in InfluxDB 2,
-# InfluxDB 3, or VictoriaMetrics.
+# InfluxDB 3, and/or VictoriaMetrics.  Multiple backends can be
+# active simultaneously.
 #
 # Can run as a one-shot command (backward compatible with cron) or as a
 # continuous daemon managed by systemd.
@@ -265,7 +266,7 @@ def create_default_config(path):
 def parse_args():
     parser = argparse.ArgumentParser(
         description='Unified SensorPush daemon - queries the SensorPush API and '
-                    'stores readings in InfluxDB 2, InfluxDB 3, or VictoriaMetrics')
+                    'stores readings in InfluxDB 2, InfluxDB 3, and/or VictoriaMetrics')
     parser.add_argument(
         '-s', '--start', dest='starttime', default='', type=str,
         help='Start query at time (e.g. "2019-07-25T00:10:41+0200")')
@@ -305,9 +306,11 @@ def parse_args():
     # New arguments
     parser.add_argument(
         '--backend', dest='backend',
+        nargs='+',
         choices=['influxdb2', 'influxdb3', 'victoriametrics'],
         default=None,
-        help='Database backend (overrides config file setting)')
+        help='Database backend(s) (overrides config file). '
+             'Specify multiple to write to all simultaneously')
     parser.add_argument(
         '--daemon', dest='daemon', action='store_true', default=False,
         help='Run as a continuous daemon (default: one-shot mode)')
@@ -664,6 +667,14 @@ def create_writer(backend_name, config):
         raise ValueError(f"Unknown backend: {backend_name}")
 
 
+def create_writers(backend_names, config):
+    """Create writer instances for all specified backends."""
+    writers = []
+    for name in backend_names:
+        writers.append(create_writer(name, config))
+    return writers
+
+
 # -----------------------------------------------------------------------------
 # SensorPush API
 # -----------------------------------------------------------------------------
@@ -922,9 +933,9 @@ def process_samples(samples, sensors, measurement_name, my_altitude, noconvert):
 class SensorPushDaemon:
     """Main daemon: handles collection cycles, retries, and gap-filling."""
 
-    def __init__(self, api, writer, config, args):
+    def __init__(self, api, writers, config, args):
         self.api = api
-        self.writer = writer
+        self.writers = writers
         self.config = config
         self.args = args
         self.running = True
@@ -945,11 +956,9 @@ class SensorPushDaemon:
             logger.info("Received SIGHUP, will reload configuration on next cycle")
 
     def _get_measurement_name(self):
-        """Get the measurement name from the active backend config."""
-        backend = self.args.backend or self.config['backend']
-        backend_config = self.config.get(backend)
-        if backend_config:
-            return backend_config.get('measurement_name', 'SensorPush')
+        """Get the measurement name from the first active backend."""
+        if self.writers:
+            return self.writers[0].measurement_name
         return 'SensorPush'
 
     def _interruptible_sleep(self, seconds):
@@ -964,8 +973,8 @@ class SensorPushDaemon:
         interval = self.args.interval or self.config['daemon']['interval']
         logger.info("Starting SensorPush daemon (interval=%ds)", interval)
 
-        # Connect to backend (with retry)
-        self._connect_writer()
+        # Connect to all backends (with retry)
+        self._connect_writers()
 
         consecutive_failures = 0
         max_consecutive_failures = 50
@@ -988,22 +997,38 @@ class SensorPushDaemon:
 
             self._interruptible_sleep(interval)
 
-        self.writer.close()
+        for w in self.writers:
+            try:
+                w.close()
+            except Exception as e:
+                logger.warning("Error closing %s: %s", type(w).__name__, e)
         logger.info("Daemon stopped")
 
-    def _connect_writer(self):
-        """Connect to backend with retry on failure."""
-        for attempt, delay in enumerate(RETRY_DELAYS, 1):
-            try:
-                self.writer.connect()
-                return
-            except Exception as e:
-                logger.error("Failed to connect to backend (attempt %d/%d): %s",
-                             attempt, len(RETRY_DELAYS), e)
-                if attempt < len(RETRY_DELAYS):
-                    logger.info("Retrying in %ds...", delay)
-                    self._interruptible_sleep(delay)
-        raise ConnectionError("Failed to connect to backend after all retries")
+    def _connect_writers(self):
+        """Connect all backend writers with retries. Fails only if ALL fail."""
+        failed = []
+        for writer in self.writers:
+            connected = False
+            for attempt, delay in enumerate(RETRY_DELAYS, 1):
+                try:
+                    writer.connect()
+                    connected = True
+                    break
+                except Exception as e:
+                    logger.error("Failed to connect %s (attempt %d/%d): %s",
+                                 type(writer).__name__, attempt,
+                                 len(RETRY_DELAYS), e)
+                    if attempt < len(RETRY_DELAYS):
+                        logger.info("Retrying in %ds...", delay)
+                        self._interruptible_sleep(delay)
+            if not connected:
+                failed.append(type(writer).__name__)
+        if len(failed) == len(self.writers):
+            raise ConnectionError(
+                "Failed to connect to any backend: " + ', '.join(failed))
+        if failed:
+            logger.warning("Some backends unavailable: %s. "
+                           "Writes will be retried.", ', '.join(failed))
 
     def _collect_cycle(self):
         """One collection cycle: auth, fetch, process, write."""
@@ -1035,7 +1060,7 @@ class SensorPushDaemon:
         # Determine time window (gap-filling in daemon mode)
         if self.args.daemon:
             starttime, stoptime = self._compute_daemon_window(
-                mytz, currenttime, measurement_name)
+                mytz, currenttime)
         else:
             starttime, stoptime = self._compute_oneshot_window(
                 mytz, currenttime)
@@ -1057,17 +1082,23 @@ class SensorPushDaemon:
             self._fetch_and_write_window(
                 window, i, iterations, sensors, measurement_name)
 
-    def _compute_daemon_window(self, mytz, currenttime, measurement_name):
+    def _compute_daemon_window(self, mytz, currenttime):
         """Compute time window for daemon mode with gap-filling."""
         poll_backlog_str = self.config['daemon']['poll_backlog']
         poll_backlog_min = parse_backlog(poll_backlog_str)
 
-        # Try to get last known timestamp from backend
+        # Get the oldest last-known timestamp across all backends
+        # so that every backend's gap gets filled
         last_ts = None
-        try:
-            last_ts = self.writer.get_last_timestamp(measurement_name)
-        except Exception as e:
-            logger.warning("Could not query last timestamp: %s", e)
+        for writer in self.writers:
+            try:
+                ts = writer.get_last_timestamp(writer.measurement_name)
+                if ts is not None:
+                    if last_ts is None or ts < last_ts:
+                        last_ts = ts
+            except Exception as e:
+                logger.warning("Could not query last timestamp from %s: %s",
+                               type(writer).__name__, e)
 
         if last_ts:
             # Make timezone-aware if needed
@@ -1078,7 +1109,7 @@ class SensorPushDaemon:
 
             if gap_minutes > poll_backlog_min:
                 logger.info(
-                    "Gap detected: last data at %s (%.0f min ago), "
+                    "Gap detected: oldest backend data at %s (%.0f min ago), "
                     "fetching backlog",
                     last_ts_local.strftime('%Y-%m-%dT%X%z'), gap_minutes)
                 # Fetch from 2 minutes before last known point
@@ -1183,21 +1214,25 @@ class SensorPushDaemon:
                 time.sleep(RETRYWAIT)
 
     def _safe_write(self, records):
-        """Write records with retry on backend failure."""
-        for attempt, delay in enumerate([10, 30, 60], 1):
-            try:
-                self.writer.write(records)
-                return
-            except Exception as e:
-                logger.error("Write failed (attempt %d/3): %s", attempt, e)
-                if attempt < 3:
-                    time.sleep(delay)
-        if self.args.daemon:
-            logger.error("Failed to write to backend after 3 attempts, "
-                         "skipping batch")
-        else:
+        """Write records to all backends with retry on failure."""
+        all_failed = True
+        for writer in self.writers:
+            for attempt, delay in enumerate([10, 30, 60], 1):
+                try:
+                    writer.write(records)
+                    all_failed = False
+                    break
+                except Exception as e:
+                    logger.error("Write to %s failed (attempt %d/3): %s",
+                                 type(writer).__name__, attempt, e)
+                    if attempt < 3:
+                        time.sleep(delay)
+            else:
+                logger.error("Failed to write to %s after 3 attempts, "
+                             "skipping batch", type(writer).__name__)
+        if all_failed and not self.args.daemon:
             raise ConnectionError(
-                "Failed to write to backend after 3 attempts")
+                "Failed to write to any backend after 3 attempts")
 
     def _log_dryrun(self, records):
         """Log records in dryrun mode."""
@@ -1214,11 +1249,16 @@ class SensorPushDaemon:
 
     def run_once(self):
         """Single collection cycle (backward compatible one-shot mode)."""
-        self._connect_writer()
+        self._connect_writers()
         try:
             self._collect_cycle()
         finally:
-            self.writer.close()
+            for w in self.writers:
+                try:
+                    w.close()
+                except Exception as e:
+                    logger.warning("Error closing %s: %s",
+                                   type(w).__name__, e)
 
 
 # -----------------------------------------------------------------------------
@@ -1282,8 +1322,11 @@ def main():
     # Load config
     config = load_config(config_path)
 
-    # CLI overrides
-    backend_name = args.backend or config['backend']
+    # Determine backend(s)
+    if args.backend:
+        backend_names = args.backend  # list from nargs='+'
+    else:
+        backend_names = [b.strip() for b in config['backend'].split(',')]
 
     # Handle list-only commands
     if args.listsensors or args.listgateways:
@@ -1297,14 +1340,15 @@ def main():
             display_sensors(api.get_sensors())
         return 0
 
-    # Create API client and writer
+    # Create API client and writers
     api = SensorPushAPI(config['login'], config['password'],
                         verify_ssl=VERIFY_SSL,
                         force_ipv4=config['force_ipv4'])
-    writer = create_writer(backend_name, config)
+    logger.info("Active backend(s): %s", ', '.join(backend_names))
+    writers = create_writers(backend_names, config)
 
     # Run
-    daemon = SensorPushDaemon(api, writer, config, args)
+    daemon = SensorPushDaemon(api, writers, config, args)
 
     if args.daemon:
         daemon.run()
