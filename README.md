@@ -7,65 +7,153 @@ If you don't have an G1 WIFI Gateway and still want to plot your temperature, yo
 
 ![Grafana](https://github.com/bolausson/SensorPush/blob/master/SensorPush-Grafana-InfluxDB.png?raw=true)
 
-## Available Scripts
+## sensorpushd.py - Unified Daemon (Recommended)
 
-There are three versions of the script for different database backends:
+`sensorpushd.py` is the unified replacement for the individual scripts. It supports **InfluxDB 2**, **InfluxDB 3**, and **VictoriaMetrics** in a single tool, and can run either as a one-shot command (for cron) or as a continuous daemon (managed by systemd).
 
-| Script | Database | Description |
+### Installation
+
+```bash
+# Required for all backends:
+pip install requests
+
+# Only install what you need for your chosen backend:
+pip install influxdb-client      # for InfluxDB 2
+pip install influxdb3-python     # for InfluxDB 3
+# VictoriaMetrics needs no extra packages
+```
+
+### Quick Start
+
+```bash
+# First run creates a config template at ~/.sensorpushd.conf
+./sensorpushd.py
+
+# Edit the config file with your SensorPush credentials and backend settings
+nano ~/.sensorpushd.conf
+
+# One-shot: fetch last day of data (backward compatible with cron)
+./sensorpushd.py -b 1d --backend victoriametrics
+
+# Daemon mode: continuous polling every 5 minutes
+./sensorpushd.py --daemon --interval 300
+
+# Dry run to preview data without writing
+./sensorpushd.py -b 10m -x --backend victoriametrics
+
+# List your sensors
+./sensorpushd.py -l
+```
+
+### Migrating from the old scripts
+
+Your existing config files work directly:
+
+```bash
+# Use existing InfluxDB 2 config
+./sensorpushd.py -c ~/.sensorpush.conf -b 1d
+
+# Use existing VictoriaMetrics config
+./sensorpushd.py -c ~/.sensorpush_vm.conf -b 1d
+```
+
+### Configuration
+
+The new unified config file (`~/.sensorpushd.conf`) supports all backends. Only configure the section for the backend you use:
+
+```ini
+[SENSORPUSHAPI]
+LOGIN = your_email@example.com
+PASSWD = your_password
+
+[BACKEND]
+TYPE = victoriametrics
+
+[INFLUXDB2]
+MEASUREMENT_NAME = SensorPush
+URL = http://localhost:8086
+PORT = 8086
+TOKEN = your_token
+ORG = your_org
+BUCKET = sensorpush
+VERIFY_SSL = False
+
+[INFLUXDB3]
+MEASUREMENT_NAME = SensorPush
+HOST = localhost:8181
+DATABASE = sensorpush
+TOKEN = your_token
+
+[VICTORIAMETRICS]
+MEASUREMENT_NAME = SensorPush
+URL = http://localhost:8428
+VERIFY_SSL = False
+
+[DAEMON]
+INTERVAL = 300
+POLL_BACKLOG = 10m
+
+[MISC]
+MY_ALTITUDE = 0.0
+FORCE_IPv4 = False
+```
+
+### Running as a systemd service
+
+```bash
+# Copy and edit the service file
+sudo cp sensorpushd.service /etc/systemd/system/
+sudo nano /etc/systemd/system/sensorpushd.service  # adjust paths
+
+# Enable and start
+sudo systemctl daemon-reload
+sudo systemctl enable --now sensorpushd
+
+# Check status and logs
+sudo systemctl status sensorpushd
+sudo journalctl -u sensorpushd -f
+```
+
+### Daemon features
+
+- **Gap-filling**: If the API or database was unavailable, the daemon automatically detects the gap on the next successful cycle and back-fills the missing data
+- **Graceful shutdown**: Responds to SIGTERM/SIGINT for clean shutdown
+- **Error recovery**: Retries with exponential backoff on API or backend failures; never exits on transient errors
+- **Token refresh**: Proactively re-authenticates before the OAuth token expires
+- **Configurable logging**: Use `--log-level` and `--log-file` for production logging
+
+### CLI reference
+
+```
+./sensorpushd.py --help
+```
+
+All arguments from the old scripts are preserved (`-s`, `-p`, `-b`, `-t`, `-q`, `-d`, `-l`, `-g`, `-i`, `-n`, `-x`, `-v`), plus new ones:
+
+| Argument | Description |
+|----------|-------------|
+| `--backend` | `influxdb2`, `influxdb3`, or `victoriametrics` |
+| `--daemon` | Run as a continuous daemon |
+| `--interval` | Polling interval in seconds (default: 300) |
+| `-c`/`--config` | Path to config file |
+| `--log-level` | `DEBUG`, `INFO`, `WARNING`, or `ERROR` |
+| `--log-file` | Log to file instead of stderr |
+
+## Legacy Scripts (Deprecated)
+
+The individual scripts are still available but deprecated in favor of `sensorpushd.py`:
+
+| Script | Database | Config File |
 |--------|----------|-------------|
-| `sensorpush.py` | InfluxDB 1.x | Original script for InfluxDB 1.x |
-| `sensorpush2.py` | InfluxDB 2.x | Updated script for InfluxDB 2.x with Flux query language |
-| `sensorpush_vm.py` | VictoriaMetrics | Script for VictoriaMetrics (Prometheus-compatible) |
-
-Each script has its own configuration file:
-- `~/.sensorpush.conf` - for InfluxDB 1.x
-- `~/.sensorpush2.conf` - for InfluxDB 2.x
-- `~/.sensorpush_vm.conf` - for VictoriaMetrics
+| `sensorpush.py` | InfluxDB 1.x | `~/.sensorpush.conf` |
+| `sensorpush2.py` | InfluxDB 2.x | `~/.sensorpush.conf` |
+| `sensorpush_vm.py` | VictoriaMetrics | `~/.sensorpush_vm.conf` |
 
 ## Grafana Dashboards
 
 Example Grafana dashboards are included:
 - `SensorPush-GrafanaDashboard.json` - Dashboard for InfluxDB
 - `SensorPush-GrafanaDashboard-vm.json` - Dashboard for VictoriaMetrics (Prometheus data source)
-
-
-## API query
-```
-# sensorpush.py --help
-usage: sensorpush.py [-h] [-s STARTTIME] [-p STOPTIME] [-b BACKLOG]
-                     [-t TIMESTEP] [-q QLIMIT] [-d DELAY] [-l] [-g]
-                     [-i SENSORLIST [SENSORLIST ...]] [-n] [-x]
-
-Queries SensorPus API and stores the temp and humidity readings in InfluxDB
-
-optional arguments:
-  -h, --help            show this help message and exit
-  -s STARTTIME, --start STARTTIME
-                        start query at time (e.g. "2019-07-25T00:10:41+0200")
-  -p STOPTIME, --stop STOPTIME
-                        Stop query at time (e.g. "2019-07-26T00:10:41+0200")
-  -b BACKLOG, --backlog BACKLOG
-                        Historical data to fetch (default 1 day) - time can be
-                        specified in the format <number>[m|h|d|w|M|Y]. E.g.:
-                        10 Minutes = 10m, 1 day = 1d, 1 month = 1M
-  -t TIMESTEP, --timestep TIMESTEP
-                        Time slice per query (in minutes) to fetch (default
-                        720 minutes [12 h])
-  -q QLIMIT, --querylimit QLIMIT
-                        Number of samples to return per sensor (default unset
-                        = API default limimt [10])
-  -d DELAY, --delay DELAY
-                        Delay in seconds between queries
-  -l, --listsensors     Show a list of sensors and exit
-  -g, --listgateways    Show a list of gateways and exit
-  -i SENSORLIST [SENSORLIST ...], --sensorlist SENSORLIST [SENSORLIST ...]
-                        List of sensor IDs to query
-  -n, --noconvert       Do not convert °F to °C, inHG to mBar, kPa to mBar and feet
-                        to meters
-  -x, --dryrun          Do not write anything to the database, just print what
-                        would have been written
-  -v, --verbose         Show full output in dryrun mode (do not truncate)
-```
 
 ## Migration from InfluxDB to VictoriaMetrics
 

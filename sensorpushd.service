@@ -1,0 +1,26 @@
+[Unit]
+Description=SensorPush Data Collection Daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Adjust the ExecStart path and user to match your installation:
+ExecStart=/usr/bin/python3 /opt/sensorpush/sensorpushd.py --daemon --config /etc/sensorpushd.conf --log-level INFO
+# ExecStart=/usr/bin/python3 /home/youruser/github/SensorPush/sensorpushd.py --daemon --log-level INFO
+Restart=on-failure
+RestartSec=30
+WatchdogSec=600
+
+# Run as a dedicated user (create with: useradd -r -s /sbin/nologin sensorpush)
+# User=sensorpush
+# Group=sensorpush
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+
+[Install]
+WantedBy=multi-user.target
