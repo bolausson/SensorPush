@@ -175,6 +175,7 @@ def _load_legacy_influxdb2(config):
             'interval': 300,
             'poll_backlog': '10m',
             'max_backfill': '0',
+            'deep_scan_interval': '1h',
         },
     }
 
@@ -199,6 +200,7 @@ def _load_legacy_vm(config):
             'interval': 300,
             'poll_backlog': '10m',
             'max_backfill': '0',
+            'deep_scan_interval': '1h',
         },
     }
 
@@ -226,6 +228,7 @@ def _load_unified(config):
             'interval': config.getint('DAEMON', 'INTERVAL', fallback=300),
             'poll_backlog': config.get('DAEMON', 'POLL_BACKLOG', fallback='10m'),
             'max_backfill': config.get('DAEMON', 'MAX_BACKFILL', fallback='0'),
+            'deep_scan_interval': config.get('DAEMON', 'DEEP_SCAN_INTERVAL', fallback='1h'),
         },
     }
 
@@ -1045,6 +1048,11 @@ class SensorPushDaemon:
         self._last_successful_time = None
         self._heartbeat = time.monotonic()
         self._watchdog_thread = None
+        # Throttling of the expensive per-sensor "deep" gap scan.
+        # _fetch_high_water is the stop time of the last completed cycle;
+        # _last_deep_scan is a monotonic timestamp of the last deep scan.
+        self._fetch_high_water = None
+        self._last_deep_scan = None
         self._setup_signals()
 
     def _setup_signals(self):
@@ -1255,19 +1263,64 @@ class SensorPushDaemon:
                 break
             self._fetch_and_write_window(
                 window, i, iterations, sensors, measurement_name)
+        else:
+            # Loop ran to completion (not aborted by shutdown): record how
+            # far we got so the next cycle can poll incrementally from here.
+            if self.args.daemon:
+                self._fetch_high_water = stoptime
 
     def _compute_daemon_window(self, mytz, currenttime, sensors):
-        """Compute time window for daemon mode with per-sensor gap-filling.
+        """Compute time window for daemon mode.
 
-        Checks each sensor individually on each backend (using the
-        temperature metric as reference) and picks the oldest timestamp
-        found.  This ensures that if a single sensor stops reporting,
-        the gap for that specific sensor is detected and back-filled.
+        Two modes:
+
+        * Deep scan - checks each sensor individually on each backend
+          (using the temperature metric as reference) and picks the
+          oldest timestamp found, so a sensor that stopped reporting has
+          its gap back-filled.  This is expensive and, while a sensor is
+          offline for a long time, would otherwise re-scan its entire
+          history on every cycle.
+        * Incremental poll - between deep scans, simply continue from the
+          high-water mark of the last completed cycle.  This keeps online
+          sensors current cheaply.  Any data buffered by a sensor that
+          comes back online is picked up by the next deep scan, which runs
+          at most every ``deep_scan_interval``.
         """
         poll_backlog_str = self.config['daemon']['poll_backlog']
         poll_backlog_min = parse_backlog(poll_backlog_str)
         max_backfill_str = self.config['daemon']['max_backfill']
         max_backfill_min = parse_backlog(max_backfill_str) if max_backfill_str != '0' else 0
+        deep_scan_str = self.config['daemon'].get('deep_scan_interval', '1h')
+        deep_scan_min = parse_backlog(deep_scan_str) if deep_scan_str != '0' else 0
+
+        # Decide whether a deep scan is due.  Always deep-scan on the first
+        # cycle (no high-water mark yet) and when throttling is disabled.
+        now_mono = time.monotonic()
+        deep_due = (
+            self._fetch_high_water is None
+            or self._last_deep_scan is None
+            or deep_scan_min <= 0
+            or (now_mono - self._last_deep_scan) >= deep_scan_min * 60
+        )
+
+        if not deep_due:
+            # Incremental poll from the last completed cycle, with a small
+            # overlap, but never a shorter window than poll_backlog.
+            overlap = datetime.timedelta(minutes=2)
+            fast_start = self._fetch_high_water - overlap
+            backlog_start = currenttime - datetime.timedelta(
+                minutes=poll_backlog_min)
+            starttime = min(fast_start, backlog_start)
+            mins_to_deep = deep_scan_min - (now_mono - self._last_deep_scan) / 60
+            logger.info(
+                "Incremental poll from %s (deep scan in ~%.0f min)",
+                starttime.strftime('%Y-%m-%dT%X%z'), max(0, mins_to_deep))
+            return starttime, currenttime
+
+        # --- deep scan ---
+        self._last_deep_scan = now_mono
+        logger.info("Running deep gap scan (deep_scan_interval=%s)",
+                    deep_scan_str)
 
         # Build sensor ID list (same IDs used as tags in records)
         sensor_ids = list(sensors.keys())
