@@ -38,6 +38,7 @@ import math
 import signal
 import socket
 import logging
+import threading
 import requests
 import datetime
 import argparse
@@ -79,6 +80,10 @@ VERIFY_SSL = False
 RETRYWAIT = 60
 MAXRETRY = 3
 RETRY_DELAYS = [10, 30, 60, 120, 300]
+# Stop feeding the systemd watchdog if the main loop makes no progress for
+# this many seconds.  Must be larger than any single legitimate blocking
+# step (an API call + its retries) but small enough to catch a real hang.
+WATCHDOG_HANG_THRESHOLD = 900
 
 API_URL_BASE = 'https://api.sensorpush.com/api/v1'
 API_URL_OA_AUTH = f'{API_URL_BASE}/oauth/authorize'
@@ -1038,6 +1043,8 @@ class SensorPushDaemon:
         self.args = args
         self.running = True
         self._last_successful_time = None
+        self._heartbeat = time.monotonic()
+        self._watchdog_thread = None
         self._setup_signals()
 
     def _setup_signals(self):
@@ -1053,6 +1060,58 @@ class SensorPushDaemon:
         elif signum == signal.SIGHUP:
             logger.info("Received SIGHUP, will reload configuration on next cycle")
 
+    def _touch(self):
+        """Record forward progress for the watchdog heartbeat.
+
+        A plain float assignment is atomic under the GIL, so no lock is
+        needed.  Called whenever the daemon does meaningful work (each
+        cycle, each fetch iteration, each second of sleep) so the
+        background feeder knows the main loop is alive.
+        """
+        self._heartbeat = time.monotonic()
+
+    def _start_watchdog(self):
+        """Feed the systemd watchdog from a background thread.
+
+        The feeder pings systemd only while the main loop keeps making
+        progress (see _touch).  This lets a long but healthy operation -
+        e.g. backfilling days or weeks of data for a sensor that has been
+        offline - run to completion without being killed, while a process
+        that is genuinely stuck stops being pinged and gets restarted by
+        systemd.  Does nothing when not running under a watchdog.
+        """
+        wd_usec = os.environ.get('WATCHDOG_USEC')
+        if not wd_usec:
+            logger.debug("No systemd watchdog configured (WATCHDOG_USEC unset)")
+            return
+        try:
+            wd_sec = int(wd_usec) / 1_000_000.0
+        except ValueError:
+            logger.warning("Invalid WATCHDOG_USEC=%r, watchdog feeder disabled",
+                           wd_usec)
+            return
+        ping_interval = max(1.0, wd_sec / 3.0)
+
+        def _loop():
+            while self.running:
+                stale = time.monotonic() - self._heartbeat
+                if stale < WATCHDOG_HANG_THRESHOLD:
+                    sd_notify('WATCHDOG=1')
+                else:
+                    logger.error(
+                        "Watchdog heartbeat stale for %.0fs (>%ds) - not "
+                        "pinging systemd; the daemon will be restarted",
+                        stale, WATCHDOG_HANG_THRESHOLD)
+                time.sleep(ping_interval)
+
+        self._watchdog_thread = threading.Thread(
+            target=_loop, name="watchdog-feeder", daemon=True)
+        self._watchdog_thread.start()
+        logger.info(
+            "Watchdog feeder started (timeout=%.0fs, ping every %.0fs, "
+            "hang threshold=%ds)",
+            wd_sec, ping_interval, WATCHDOG_HANG_THRESHOLD)
+
     def _get_measurement_name(self):
         """Get the measurement name from the first active backend."""
         if self.writers:
@@ -1062,14 +1121,14 @@ class SensorPushDaemon:
     def _interruptible_sleep(self, seconds):
         """Sleep that can be interrupted by signals.
 
-        Sends a systemd watchdog ping every 60 seconds during sleep
-        so the WatchdogSec timer does not expire.
+        Updates the watchdog heartbeat every second so the background
+        feeder keeps the systemd timer satisfied during idle periods
+        (between cycles and during retry backoffs).
         """
         for i in range(seconds):
             if not self.running:
                 return
-            if i > 0 and i % 60 == 0:
-                sd_notify('WATCHDOG=1')
+            self._touch()
             time.sleep(1)
 
     def run(self):
@@ -1081,12 +1140,13 @@ class SensorPushDaemon:
         self._connect_writers()
 
         sd_notify('READY=1')
+        self._start_watchdog()
 
         consecutive_failures = 0
         max_consecutive_failures = 50
 
         while self.running:
-            sd_notify('WATCHDOG=1')
+            self._touch()
             try:
                 self._collect_cycle()
                 consecutive_failures = 0
@@ -1230,6 +1290,7 @@ class SensorPushDaemon:
             for sid in sensor_ids:
                 if not self.running:
                     break
+                self._touch()
                 # sensor_id tag is stored as float(key), e.g. "1234567.0"
                 sid_tag = str(float(sid))
                 try:
@@ -1306,6 +1367,7 @@ class SensorPushDaemon:
         retrycount = 0
         while True:
             try:
+                self._touch()
                 logger.info("Iteration %d/%d", iteration, iterations)
 
                 # The SensorPush API defaults to ~10 samples per sensor
@@ -1376,7 +1438,7 @@ class SensorPushDaemon:
                         raise
                 logger.info("Retrying in %ds (attempt %d/%d)",
                             RETRYWAIT, retrycount, MAXRETRY)
-                time.sleep(RETRYWAIT)
+                self._interruptible_sleep(RETRYWAIT)
 
     def _safe_write(self, records):
         """Write records to all backends with retry and reconnection."""
@@ -1417,7 +1479,7 @@ class SensorPushDaemon:
                                  type(writer).__name__, attempt,
                                  time.time() - t0, e)
                     if attempt < 2:
-                        time.sleep(delay)
+                        self._interruptible_sleep(delay)
             else:
                 writer._consecutive_failures += 1
                 logger.error("Failed to write to %s after 2 attempts "
