@@ -1766,6 +1766,14 @@ class SensorPushDaemon:
         data, so it costs exactly one cheap probe per deep scan and never
         triggers a back-fill - which is what stops one dead sensor from
         forcing a full-history refetch of everything, every hour.
+
+        The gap is recorded as soon as a sensor falls behind, *before* it
+        returns.  Gap detection reads the newest stored point, so the
+        moment a sensor resumes, the ordinary incremental poll stores a
+        fresh sample and that point jumps to the present - the sensor
+        stops looking stale and the hole behind it becomes invisible.
+        Remembering the gap up front is what keeps a returning sensor's
+        backlog recoverable.
         """
         per_sensor = getattr(self, '_sensor_last_stored', {})
         collector_hw = getattr(self, '_collector_high_water', None)
@@ -1785,36 +1793,48 @@ class SensorPushDaemon:
             lag_min = (collector_hw - last_ts).total_seconds() / 60
             key = str(sid)
 
-            if lag_min <= stale_after_min:
-                # Within normal reporting jitter - nothing to do.
-                if self._sensor_state.pop(key, None):
-                    logger.info("Sensor '%s' is current again", name)
+            state = self._sensor_state.get(key)
+
+            if state is None:
+                if lag_min <= stale_after_min:
+                    continue  # keeping up with the pack - nothing to do
+                # First time this sensor is seen behind.  Record the gap
+                # now; once it resumes there is no way to find it again.
+                self._sensor_state[key] = {
+                    'gap_from': last_ts.isoformat(),
+                    'stale_since': now,
+                }
+                logger.info(
+                    "Sensor '%s' has fallen behind (no data since %s, %.1f h); "
+                    "recorded its gap to back-fill when it returns", name,
+                    last_ts.strftime('%Y-%m-%dT%X%z'), lag_min / 60)
                 continue
 
-            if not self._sensor_has_new_data(sid, last_ts, currenttime):
-                if self._sensor_state.pop(key, None):
+            # A gap is on file for this sensor.  From here the current lag
+            # is irrelevant - the sensor may already look current again
+            # while the hole behind it is still unfilled.
+            gap_from = datetime.datetime.fromisoformat(state['gap_from'])
+
+            if not self._sensor_has_new_data(sid, gap_from, currenttime):
+                if state.pop('returned_at', None):
                     logger.info("Sensor '%s' stopped reporting again before "
                                 "its back-fill ran; rearming", name)
                 else:
                     logger.info(
-                        "Sensor '%s' has no new data (last seen %s, %.0f h "
-                        "behind); nothing to back-fill yet", name,
-                        last_ts.strftime('%Y-%m-%dT%X%z'), lag_min / 60)
+                        "Sensor '%s' still has no data since %s; nothing to "
+                        "back-fill yet", name,
+                        gap_from.strftime('%Y-%m-%dT%X%z'))
                 continue
 
-            state = self._sensor_state.get(key)
-            if state is None:
-                self._sensor_state[key] = {
-                    'returned_at': now,
-                    'gap_from': last_ts.isoformat(),
-                }
+            if 'returned_at' not in state:
+                state['returned_at'] = now
                 logger.info(
-                    "Sensor '%s' is reporting again after %.1f h; waiting %s "
+                    "Sensor '%s' is reporting again (gap since %s); waiting %s "
                     "for its gateway to finish uploading before back-filling",
-                    name, lag_min / 60, grace_str)
+                    name, gap_from.strftime('%Y-%m-%dT%X%z'), grace_str)
                 continue
 
-            waited = now - float(state.get('returned_at', now))
+            waited = now - float(state['returned_at'])
             # Small tolerance: probes happen once per deep scan, so an exact
             # comparison would routinely miss by a second and push the
             # back-fill out by a whole extra scan interval.
@@ -1825,8 +1845,8 @@ class SensorPushDaemon:
                 continue
 
             logger.info("Sensor '%s' settled for %.0f min; back-filling from %s",
-                        name, waited / 60, last_ts.strftime('%Y-%m-%dT%X%z'))
-            if self._backfill_sensor(sid, last_ts, currenttime, sensors,
+                        name, waited / 60, gap_from.strftime('%Y-%m-%dT%X%z'))
+            if self._backfill_sensor(sid, gap_from, currenttime, sensors,
                                      measurement_name):
                 self._sensor_state.pop(key, None)
                 logger.info("Sensor '%s' back-fill complete", name)
