@@ -2,15 +2,30 @@
 Description=SensorPush Data Collection Daemon
 After=network-online.target
 Wants=network-online.target
+# The daemon backs off instead of exiting when the upstream API is down, so
+# an exit means something genuinely broke.  Keep restarting it regardless:
+# a start limit here would turn a transient problem into a permanent stop,
+# which is how a 2026-07-16 API outage became 12 days of missing data.
+# Staleness is alerted on separately by sensorpushd-freshness.timer.
+StartLimitIntervalSec=0
 
 [Service]
 Type=notify
 # Adjust the ExecStart path and user to match your installation:
 ExecStart=/usr/bin/python3 /opt/sensorpush/sensorpushd.py --daemon --config /etc/sensorpushd.conf --log-level INFO
 # ExecStart=/usr/bin/python3 /home/youruser/github/SensorPush/sensorpushd.py --daemon --log-level INFO
-Restart=on-failure
+# Restart on *any* exit, not just a failing one.  The daemon now reports real
+# faults with a non-zero status, but a clean exit must not silently end data
+# collection either.
+Restart=always
 RestartSec=30
 WatchdogSec=600
+# Connecting to the backends retries for up to ~220s before READY=1 is sent.
+TimeoutStartSec=600
+# Creates /var/lib/sensorpushd, which stays writable under
+# ProtectSystem=strict.  Holds sensor-return tracking, the queue of failed
+# windows, and the last-success timestamp.
+StateDirectory=sensorpushd
 
 # Run as a dedicated user (create with: useradd -r -s /sbin/nologin sensorpush)
 # User=sensorpush

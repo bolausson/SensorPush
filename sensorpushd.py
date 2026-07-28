@@ -35,9 +35,11 @@ import sys
 import json
 import time
 import math
+import random
 import signal
 import socket
 import logging
+import tempfile
 import threading
 import requests
 import datetime
@@ -46,18 +48,49 @@ import configparser
 from abc import ABC, abstractmethod
 from pathlib import Path
 from requests.adapters import HTTPAdapter
-from requests.packages.urllib3.exceptions import InsecureRequestWarning
 
-# Suppress SSL warnings globally
-requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
+
+def suppress_insecure_warnings():
+    """Silence urllib3's InsecureRequestWarning.
+
+    Only called when a backend is actually configured with
+    verify_ssl=False, so an unexpected certificate problem on a
+    verified connection still surfaces instead of being hidden.
+    """
+    try:
+        from urllib3.exceptions import InsecureRequestWarning
+        requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
+    except Exception:
+        pass
+
+
+def enable_force_ipv4():
+    """Force IPv4-only outbound connections for urllib3.
+
+    On networks where IPv6 to api.sensorpush.com blackholes, a plain
+    connect() stalls for minutes before falling back.  urllib3 reads
+    HAS_IPV6 at call time, so flipping it here affects every later
+    connection.  This is process-global, hence a single explicit call
+    from main() rather than a constructor side effect.
+    """
+    try:
+        import urllib3.util.connection
+        urllib3.util.connection.HAS_IPV6 = False
+        return True
+    except Exception as e:
+        logger.warning("Could not force IPv4: %s", e)
+        return False
 
 
 def sd_notify(state):
-    """Send a notification to the systemd watchdog (if available).
+    """Send a notification to systemd (if available).
 
     Uses the NOTIFY_SOCKET environment variable set by systemd for
     Type=notify or WatchdogSec services.  Silently does nothing when
     the socket is not available (e.g. running outside systemd).
+
+    The protocol is newline-delimited ``KEY=value``; callers passing
+    free-form text (STATUS=) must sanitize it first - see sd_status().
     """
     sock_path = os.environ.get('NOTIFY_SOCKET')
     if not sock_path:
@@ -71,19 +104,40 @@ def sd_notify(state):
     except Exception:
         pass
 
+
+def sd_status(text):
+    """Report a one-line human-readable status to systemd.
+
+    Shows up in ``systemctl status`` so a degraded-but-running daemon
+    is visible without trawling the journal.
+    """
+    sd_notify('STATUS=' + str(text).replace('\n', ' ')[:200])
+
+
 logger = logging.getLogger('sensorpushd')
 
 # -----------------------------------------------------------------------------
 # Constants
 # -----------------------------------------------------------------------------
-VERIFY_SSL = False
+# api.sensorpush.com presents a valid public certificate chain, and the
+# account password is sent in the auth request body - always verify it.
+# The LAN backends have their own per-section verify_ssl settings.
+VERIFY_SSL = True
 RETRYWAIT = 60
 MAXRETRY = 3
 RETRY_DELAYS = [10, 30, 60, 120, 300]
 # Stop feeding the systemd watchdog if the main loop makes no progress for
 # this many seconds.  Must be larger than any single legitimate blocking
 # step (an API call + its retries) but small enough to catch a real hang.
+# Derived from WatchdogSec at runtime; this is the floor and the fallback.
 WATCHDOG_HANG_THRESHOLD = 900
+# Cap on the exponential backoff applied between failed collection cycles.
+MAX_CYCLE_BACKOFF = 3600
+# Log a failing cycle at CRITICAL (and report it to systemd) once this many
+# consecutive failures have accumulated.
+CYCLE_ALERT_AFTER = 12
+# HTTP status codes worth retrying: transient server-side or rate limiting.
+RETRYABLE_STATUS = frozenset({408, 425, 429, 500, 502, 503, 504})
 
 API_URL_BASE = 'https://api.sensorpush.com/api/v1'
 API_URL_OA_AUTH = f'{API_URL_BASE}/oauth/authorize'
@@ -99,6 +153,32 @@ HTTP_OA_HEAD = {'accept': 'application/json',
 
 MEASURES = ["altitude", "barometric_pressure", "dewpoint", "humidity",
             "temperature", "vpd", "distance"]
+
+# Defaults for the [DAEMON] section, shared by the unified and legacy loaders.
+#
+#   max_consecutive_failures  0 = never give up.  The daemon backs off
+#       exponentially instead; a transient upstream outage must not end
+#       collection permanently.
+#   sensor_return_grace  How long a sensor that has started reporting again
+#       must keep reporting before its gap is back-filled, so the gateway has
+#       time to upload the sensor's buffered backlog to the cloud first.
+#   sensor_stale_after  How far a sensor may fall behind the rest before it
+#       is treated as missing rather than merely slow.  Sensors report on
+#       their own cadence, so this must be well above normal jitter or every
+#       cycle probes every sensor for nothing.
+#   gap_lookback  How far back get_last_timestamp() looks when locating
+#       existing data.  '0' = no limit.  Must exceed the longest outage the
+#       daemon should still be able to recover from.
+DEFAULT_DAEMON_CFG = {
+    'interval': 300,
+    'poll_backlog': '10m',
+    'max_backfill': '0',
+    'deep_scan_interval': '1h',
+    'max_consecutive_failures': 0,
+    'sensor_return_grace': '1h',
+    'gap_lookback': '0',
+    'sensor_stale_after': '6h',
+}
 
 
 # -----------------------------------------------------------------------------
@@ -171,12 +251,7 @@ def _load_legacy_influxdb2(config):
         },
         'influxdb3': None,
         'victoriametrics': None,
-        'daemon': {
-            'interval': 300,
-            'poll_backlog': '10m',
-            'max_backfill': '0',
-            'deep_scan_interval': '1h',
-        },
+        'daemon': dict(DEFAULT_DAEMON_CFG),
     }
 
 
@@ -196,12 +271,7 @@ def _load_legacy_vm(config):
             'url': config['VICTORIAMETRICSCONF'].get('VM_URL', 'http://localhost:8428'),
             'verify_ssl': config['VICTORIAMETRICSCONF'].getboolean('VM_VERIFY_SSL', False),
         },
-        'daemon': {
-            'interval': 300,
-            'poll_backlog': '10m',
-            'max_backfill': '0',
-            'deep_scan_interval': '1h',
-        },
+        'daemon': dict(DEFAULT_DAEMON_CFG),
     }
 
 
@@ -229,6 +299,13 @@ def _load_unified(config):
             'poll_backlog': config.get('DAEMON', 'POLL_BACKLOG', fallback='10m'),
             'max_backfill': config.get('DAEMON', 'MAX_BACKFILL', fallback='0'),
             'deep_scan_interval': config.get('DAEMON', 'DEEP_SCAN_INTERVAL', fallback='1h'),
+            'max_consecutive_failures': config.getint(
+                'DAEMON', 'MAX_CONSECUTIVE_FAILURES', fallback=0),
+            'sensor_return_grace': config.get(
+                'DAEMON', 'SENSOR_RETURN_GRACE', fallback='1h'),
+            'gap_lookback': config.get('DAEMON', 'GAP_LOOKBACK', fallback='0'),
+            'sensor_stale_after': config.get(
+                'DAEMON', 'SENSOR_STALE_AFTER', fallback='6h'),
         },
     }
 
@@ -306,9 +383,23 @@ def create_default_config(path):
     config['DAEMON'] = {
         'INTERVAL': '300',
         'POLL_BACKLOG': '10m',
+        # 0 = back-fill without limit.  Raising this off 0 caps how far the
+        # daemon can recover after a long outage - see GAP_LOOKBACK too.
+        'MAX_BACKFILL': '0',
+        'DEEP_SCAN_INTERVAL': '1h',
+        # 0 = never stop collecting; back off exponentially instead.
+        'MAX_CONSECUTIVE_FAILURES': '0',
+        # Settle time before back-filling a sensor that started reporting again.
+        'SENSOR_RETURN_GRACE': '1h',
+        # 0 = search the full history when locating existing data.
+        'GAP_LOOKBACK': '0',
+        # How far a sensor may lag the others before it counts as missing.
+        'SENSOR_STALE_AFTER': '6h',
     }
     config['MISC'] = {
         'MY_ALTITUDE': '0.0',
+        # Set to True on networks where IPv6 to api.sensorpush.com blackholes
+        # (symptom: connections hang for minutes instead of failing fast).
         'FORCE_IPv4': 'False',
     }
     with open(path, 'w') as f:
@@ -496,11 +587,16 @@ class BaseWriter(ABC):
         pass
 
     @abstractmethod
-    def get_last_timestamp(self, measurement_name, sensor_id=None):
+    def get_last_timestamp(self, measurement_name, sensor_id=None,
+                           lookback_min=0):
         """Query the backend for the most recent data point timestamp.
 
         If sensor_id is given, returns the last timestamp for that
         specific sensor (using the temperature metric as reference).
+        ``lookback_min`` bounds how far back to search; 0 searches the
+        full history.  A bound shorter than the actual gap makes the
+        sensor look like it has no data at all, which silently disables
+        back-filling - so the caller derives it from max_backfill.
         Returns a datetime object or None if no data exists.
         """
         pass
@@ -548,7 +644,8 @@ class InfluxDB2Writer(BaseWriter):
             url=self.url,
             token=self.token,
             org=self.org,
-            verify_ssl=self.verify_ssl
+            verify_ssl=self.verify_ssl,
+            timeout=15_000  # ms; the library default (10s) is undeclared
         )
         self.write_api = self.client.write_api(write_options=SYNCHRONOUS)
         self.query_api = self.client.query_api()
@@ -560,25 +657,40 @@ class InfluxDB2Writer(BaseWriter):
             return
         self.write_api.write(bucket=self.bucket, org=self.org, record=records)
 
-    def get_last_timestamp(self, measurement_name, sensor_id=None):
+    def get_last_timestamp(self, measurement_name, sensor_id=None,
+                           lookback_min=0):
         try:
             sensor_filter = ''
             if sensor_id is not None:
                 sensor_filter = (
                     f' |> filter(fn: (r) => r.sensor_id == "{sensor_id}")'
                 )
+            # 0 = unbounded: start from the Unix epoch rather than a
+            # relative window, so a sensor stale for longer than the
+            # window is still found.
+            start = f'-{int(lookback_min)}m' if lookback_min else '1970-01-01T00:00:00Z'
+            # last() runs per series, which is index-cheap.  A sensor that
+            # was ever renamed has one series per name under the same
+            # sensor_id, so this returns several rows - the caller takes the
+            # newest.  (Collapsing with group()+sort() in Flux instead would
+            # sort the entire history: ~26s across 18 sensors versus ~1s.)
             query = (
                 f'from(bucket: "{self.bucket}")'
-                f' |> range(start: -30d)'
+                f' |> range(start: {start})'
                 f' |> filter(fn: (r) => r._measurement == "{measurement_name}"'
                 f'    and r._field == "temperature")'
                 f'{sensor_filter}'
                 f' |> last()'
             )
             tables = self.query_api.query(query, org=self.org)
+            newest = None
             for table in tables:
                 for record in table.records:
-                    return record.get_time()
+                    ts = record.get_time()
+                    if ts is not None and (newest is None or ts > newest):
+                        newest = ts
+            if newest is not None:
+                return newest
         except Exception as e:
             logger.warning("Failed to query last timestamp from InfluxDB 2: %s", e)
         return None
@@ -618,7 +730,8 @@ class InfluxDB3Writer(BaseWriter):
             host=self.url,
             database=self.database,
             token=self.token,
-            write_client_options=wco
+            write_client_options=wco,
+            verify_ssl=self.verify_ssl
         )
         self._connected = True
         logger.info("Connected to InfluxDB 3 at %s", self.url)
@@ -628,15 +741,23 @@ class InfluxDB3Writer(BaseWriter):
             return
         self.client.write(record=records)
 
-    def get_last_timestamp(self, measurement_name, sensor_id=None):
+    def get_last_timestamp(self, measurement_name, sensor_id=None,
+                           lookback_min=0):
         try:
             sensor_filter = ''
             if sensor_id is not None:
                 sensor_filter = f" AND sensor_id = '{sensor_id}'"
+            # 0 = unbounded: omit the time predicate entirely.
+            if lookback_min:
+                where = (f" WHERE time > now() - INTERVAL '{int(lookback_min)} minutes'"
+                         f'{sensor_filter}')
+            elif sensor_id is not None:
+                where = f" WHERE sensor_id = '{sensor_id}'"
+            else:
+                where = ''
             query = (
                 f'SELECT max(time) AS last_time FROM "{measurement_name}"'
-                f" WHERE time > now() - INTERVAL '30 days'"
-                f'{sensor_filter}'
+                f'{where}'
             )
             result = self.client.query(query)
             if result and len(result) > 0:
@@ -708,7 +829,8 @@ class VMWriter(BaseWriter):
             lines.append(json.dumps(json_obj, ensure_ascii=False))
         return lines
 
-    def get_last_timestamp(self, measurement_name, sensor_id=None):
+    def get_last_timestamp(self, measurement_name, sensor_id=None,
+                           lookback_min=0):
         try:
             # Use last_over_time() which is standard MetricsQL.  The response
             # timestamp in the [value] array tells us when the last point was.
@@ -717,7 +839,10 @@ class VMWriter(BaseWriter):
                 sensor_filter = f'sensor_id="{sensor_id}"'
             url = f'{self.url}/api/v1/query'
             metric = f'{measurement_name}_temperature'
-            query_str = f'last_over_time({metric}{{{sensor_filter}}}[30d])'
+            # MetricsQL has no unbounded lookbehind; 10y stands in for
+            # "no limit" and comfortably exceeds any real retention.
+            window = f'{int(lookback_min)}m' if lookback_min else '10y'
+            query_str = f'last_over_time({metric}{{{sensor_filter}}}[{window}])'
             response = self.session.get(
                 url,
                 params={'query': query_str},
@@ -728,8 +853,10 @@ class VMWriter(BaseWriter):
             data = response.json()
             results = data.get('data', {}).get('result', [])
             if results:
-                # [0] = unix timestamp, [1] = value
-                ts = float(results[0]['value'][0])
+                # One result per label set, so a renamed sensor yields
+                # several series under the same sensor_id - take the
+                # newest, not the first.  [0] = unix timestamp, [1] = value
+                ts = max(float(r['value'][0]) for r in results)
                 return datetime.datetime.fromtimestamp(
                     ts, tz=datetime.timezone.utc)
             return None
@@ -777,66 +904,89 @@ def create_writers(backend_names, config):
 # -----------------------------------------------------------------------------
 # SensorPush API
 # -----------------------------------------------------------------------------
+class AuthCredentialsError(Exception):
+    """The API rejected the credentials themselves.
+
+    Distinct from a transient outage: retrying will not help, so callers
+    should surface this rather than burning the retry budget on it.
+    """
+
+
 class SensorPushAPI:
     """Client for the SensorPush cloud API."""
 
-    def __init__(self, login, password, verify_ssl=False, force_ipv4=False):
+    def __init__(self, login, password, verify_ssl=True, sleep_func=None):
         self.login = login
         self.password = password
         self.verify_ssl = verify_ssl
-        if force_ipv4:
-            import urllib3.util.connection
-            urllib3.util.connection.HAS_IPV6 = False
+        # Injected by the daemon so retry sleeps stay interruptible and keep
+        # feeding the watchdog.  Defaults to a plain sleep for one-shot use.
+        self.sleep = sleep_func or time.sleep
         self.session = requests.Session()
         self.session.mount(API_URL_BASE, HTTPAdapter(max_retries=0))
         self.access_token = None
         self._token_time = None
         self._auth_header = None
 
-    def authenticate(self):
-        """Perform OAuth authentication flow with retry."""
-        http_data = json.dumps({'email': self.login, 'password': self.password})
+    def _auth_post(self, url, data, what):
+        """POST one step of the OAuth flow, retrying transient failures.
 
-        # Step 1: Get authorization string
-        auth = None
+        Both auth steps go through here.  A 4xx other than 429 means the
+        request itself is wrong (bad credentials, malformed body) and is
+        raised immediately - only genuinely transient conditions consume
+        retries, with exponential backoff plus jitter so a fleet of
+        clients does not resynchronise on a recovering server.
+        """
+        last = None
         for attempt in range(1, MAXRETRY + 1):
-            logger.info("Fetching API oauth authorization string - try %d/%d",
-                        attempt, MAXRETRY)
+            logger.info("%s - try %d/%d", what, attempt, MAXRETRY)
             try:
-                r = self.session.post(API_URL_OA_AUTH, headers=HTTP_OA_HEAD,
-                                      data=http_data, verify=self.verify_ssl,
-                                      timeout=30)
+                r = self.session.post(url, headers=HTTP_OA_HEAD, data=data,
+                                      verify=self.verify_ssl, timeout=30)
                 if r.status_code == 200:
-                    auth = r.content.decode('utf-8')
-                    break
-                else:
-                    logger.error("Auth request failed with status %d", r.status_code)
-            except (requests.exceptions.ConnectionError,
-                    requests.exceptions.Timeout) as e:
-                logger.warning("Connection error during auth: %s", e)
+                    return r
+                last = f"status {r.status_code}"
+                if r.status_code in (401, 403):
+                    raise AuthCredentialsError(
+                        f"{what} rejected the credentials (status "
+                        f"{r.status_code}) - check login/password")
+                if r.status_code not in RETRYABLE_STATUS:
+                    raise ConnectionError(f"{what} failed with status "
+                                          f"{r.status_code}")
+                logger.error("%s failed with status %d (retryable)",
+                             what, r.status_code)
+            except requests.exceptions.RequestException as e:
+                last = str(e)
+                logger.warning("Connection error during %s: %s", what, e)
 
             if attempt >= MAXRETRY:
-                raise ConnectionError(
-                    f"Failed to fetch API oauth authorization after {MAXRETRY} attempts")
-            time.sleep(20)
+                break
+            # 20s, 40s, 80s ... capped, plus up to 25% jitter.
+            delay = min(20 * 2 ** (attempt - 1), 160)
+            delay = int(delay * (1 + random.random() * 0.25))
+            logger.info("Retrying %s in %ds", what, delay)
+            self.sleep(delay)
 
-        # Step 2: Get access token
-        logger.info("Fetching API oauth access token")
-        r = self.session.post(API_URL_OA_ATOK, headers=HTTP_OA_HEAD,
-                              data=auth, verify=self.verify_ssl,
-                              timeout=30)
+        raise ConnectionError(
+            f"{what} failed after {MAXRETRY} attempts (last: {last})")
 
-        if r.status_code == 200:
-            self.access_token = json.loads(r.content.decode('utf-8'))['accesstoken']
-            self._token_time = time.time()
-            self._auth_header = {
-                'accept': 'application/json',
-                'Authorization': self.access_token
-            }
-            logger.info("Authentication successful")
-        else:
-            raise ConnectionError(
-                f"Access token request failed with status {r.status_code}")
+    def authenticate(self):
+        """Perform the full OAuth authentication flow."""
+        http_data = json.dumps({'email': self.login, 'password': self.password})
+
+        r = self._auth_post(API_URL_OA_AUTH, http_data,
+                            "Fetching API oauth authorization string")
+        auth = r.content.decode('utf-8')
+
+        r = self._auth_post(API_URL_OA_ATOK, auth,
+                            "Fetching API oauth access token")
+        self.access_token = json.loads(r.content.decode('utf-8'))['accesstoken']
+        self._token_time = time.time()
+        self._auth_header = {
+            'accept': 'application/json',
+            'Authorization': self.access_token
+        }
+        logger.info("Authentication successful")
 
     def _ensure_auth(self):
         """Re-authenticate if token is likely expired (>55 min)."""
@@ -845,17 +995,28 @@ class SensorPushAPI:
             self.authenticate()
 
     def _post(self, url, data=None):
-        """Make an authenticated POST request."""
+        """Make an authenticated POST request.
+
+        A 401/403 here means the cached token expired earlier than the
+        55-minute assumption, so re-authenticate once and retry rather
+        than failing the whole cycle.
+        """
         self._ensure_auth()
         http_data = json.dumps(data or {})
-        r = self.session.post(url, headers=self._auth_header,
-                              data=http_data, verify=self.verify_ssl,
-                              timeout=60)
-        if r.status_code == 200:
-            return json.loads(r.content.decode('utf-8'))
-        raise ValueError(
-            f"API request to {url} failed with status {r.status_code}: "
-            f"{r.content.decode('utf-8')}")
+        for attempt in (1, 2):
+            r = self.session.post(url, headers=self._auth_header,
+                                  data=http_data, verify=self.verify_ssl,
+                                  timeout=60)
+            if r.status_code == 200:
+                return json.loads(r.content.decode('utf-8'))
+            if r.status_code in (401, 403) and attempt == 1:
+                logger.info("Token rejected by %s, re-authenticating", url)
+                self._token_time = None
+                self._ensure_auth()
+                continue
+            raise ValueError(
+                f"API request to {url} failed with status {r.status_code}: "
+                f"{r.content.decode('utf-8')}")
 
     def get_gateways(self):
         logger.info("Fetching the list of gateways")
@@ -1048,12 +1209,114 @@ class SensorPushDaemon:
         self._last_successful_time = None
         self._heartbeat = time.monotonic()
         self._watchdog_thread = None
+        self._hang_threshold = WATCHDOG_HANG_THRESHOLD
+        # Process exit status.  Set to non-zero on any abnormal exit so
+        # systemd's Restart=on-failure/always actually sees a failure - a
+        # clean exit(0) here silently ends collection until someone notices.
+        self._exit_code = 0
         # Throttling of the expensive per-sensor "deep" gap scan.
         # _fetch_high_water is the stop time of the last completed cycle;
         # _last_deep_scan is a monotonic timestamp of the last deep scan.
         self._fetch_high_water = None
         self._last_deep_scan = None
+        # Per-sensor return tracking, persisted across restarts:
+        #   {sensor_id: {'returned_at': <epoch>, 'gap_from': <iso8601>}}
+        # A sensor that has started reporting again is recorded here and
+        # back-filled only after sensor_return_grace has elapsed.
+        self._sensor_state = {}
+        # Filled in by the deep scan, consumed by _handle_sensor_returns().
+        self._sensor_last_stored = {}
+        self._collector_high_water = None
+        # Windows whose fetch failed outright.  They are retried on later
+        # cycles; until they succeed the high-water mark must not advance
+        # past them or the hole becomes invisible to gap detection.
+        self._failed_windows = []
+        self._state_path = self._resolve_state_path()
+        self._load_state()
         self._setup_signals()
+
+    # -- persistent state ---------------------------------------------------
+
+    def _resolve_state_path(self):
+        """Pick a writable location for the sensor-return state file.
+
+        Prefers systemd's StateDirectory=, which stays writable under
+        ProtectSystem=strict.  Falls back to the XDG state dir for manual
+        runs.  Returns None if nothing is writable - the daemon then runs
+        with in-memory state only, which just means a restart re-arms the
+        grace period rather than losing data.
+        """
+        candidates = []
+        sd_state = os.environ.get('STATE_DIRECTORY')
+        if sd_state:
+            candidates.append(Path(sd_state.split(':')[0]))
+        xdg = os.environ.get('XDG_STATE_HOME')
+        candidates.append(Path(xdg) / 'sensorpushd' if xdg
+                          else Path.home() / '.local' / 'state' / 'sensorpushd')
+        for base in candidates:
+            try:
+                base.mkdir(parents=True, exist_ok=True)
+                probe = base / '.write-test'
+                probe.touch()
+                probe.unlink()
+                return base / 'state.json'
+            except Exception:
+                continue
+        logger.warning("No writable state directory found; sensor-return "
+                       "tracking will not survive a restart")
+        return None
+
+    def _load_state(self):
+        if not self._state_path or not self._state_path.is_file():
+            return
+        try:
+            with open(self._state_path) as f:
+                data = json.load(f)
+            self._sensor_state = data.get('sensors', {})
+            self._failed_windows = data.get('failed_windows', [])
+            if self._sensor_state or self._failed_windows:
+                logger.info("Restored state: %d sensor(s) pending back-fill, "
+                            "%d failed window(s) to retry",
+                            len(self._sensor_state), len(self._failed_windows))
+        except Exception as e:
+            logger.warning("Could not read state file %s: %s",
+                           self._state_path, e)
+
+    def _write_last_success(self):
+        """Publish the last time data actually reached a backend.
+
+        Process supervision cannot see the failure mode that matters most
+        - a daemon that is alive but storing nothing - so this timestamp
+        is what the freshness check alerts on.  Only written when a write
+        genuinely succeeded, never merely when a cycle did not raise.
+        """
+        if not self._state_path:
+            return
+        try:
+            path = self._state_path.parent / 'last-success'
+            tmp = path.with_suffix('.tmp')
+            tmp.write_text(self._last_successful_time.isoformat() + '\n')
+            os.replace(tmp, path)
+        except Exception as e:
+            logger.debug("Could not write last-success marker: %s", e)
+
+    def _save_state(self):
+        """Persist state atomically so a crash mid-write cannot corrupt it."""
+        if not self._state_path:
+            return
+        payload = {
+            'sensors': self._sensor_state,
+            'failed_windows': self._failed_windows,
+        }
+        try:
+            fd, tmp = tempfile.mkstemp(dir=str(self._state_path.parent),
+                                       prefix='.state-', suffix='.tmp')
+            with os.fdopen(fd, 'w') as f:
+                json.dump(payload, f)
+            os.replace(tmp, self._state_path)
+        except Exception as e:
+            logger.warning("Could not write state file %s: %s",
+                           self._state_path, e)
 
     def _setup_signals(self):
         signal.signal(signal.SIGTERM, self._handle_signal)
@@ -1064,6 +1327,7 @@ class SensorPushDaemon:
         if signum in (signal.SIGTERM, signal.SIGINT):
             logger.info("Received %s, shutting down gracefully...",
                         signal.Signals(signum).name)
+            sd_notify('STOPPING=1')
             self.running = False
         elif signum == signal.SIGHUP:
             logger.info("Received SIGHUP, will reload configuration on next cycle")
@@ -1099,17 +1363,21 @@ class SensorPushDaemon:
                            wd_usec)
             return
         ping_interval = max(1.0, wd_sec / 3.0)
+        # Derive the hang threshold from WatchdogSec so tightening the unit
+        # tightens real hang detection.  Floored so a legitimate long step
+        # (an API call plus its retries) is never mistaken for a hang.
+        self._hang_threshold = max(WATCHDOG_HANG_THRESHOLD, wd_sec * 0.75)
 
         def _loop():
             while self.running:
                 stale = time.monotonic() - self._heartbeat
-                if stale < WATCHDOG_HANG_THRESHOLD:
+                if stale < self._hang_threshold:
                     sd_notify('WATCHDOG=1')
                 else:
                     logger.error(
-                        "Watchdog heartbeat stale for %.0fs (>%ds) - not "
+                        "Watchdog heartbeat stale for %.0fs (>%.0fs) - not "
                         "pinging systemd; the daemon will be restarted",
-                        stale, WATCHDOG_HANG_THRESHOLD)
+                        stale, self._hang_threshold)
                 time.sleep(ping_interval)
 
         self._watchdog_thread = threading.Thread(
@@ -1117,8 +1385,8 @@ class SensorPushDaemon:
         self._watchdog_thread.start()
         logger.info(
             "Watchdog feeder started (timeout=%.0fs, ping every %.0fs, "
-            "hang threshold=%ds)",
-            wd_sec, ping_interval, WATCHDOG_HANG_THRESHOLD)
+            "hang threshold=%.0fs)",
+            wd_sec, ping_interval, self._hang_threshold)
 
     def _get_measurement_name(self):
         """Get the measurement name from the first active backend."""
@@ -1133,51 +1401,78 @@ class SensorPushDaemon:
         feeder keeps the systemd timer satisfied during idle periods
         (between cycles and during retry backoffs).
         """
-        for i in range(seconds):
+        for i in range(int(seconds)):
             if not self.running:
                 return
             self._touch()
             time.sleep(1)
 
     def run(self):
-        """Main daemon loop."""
+        """Main daemon loop.
+
+        Returns the process exit status.  A collection failure never ends
+        the daemon by default: the upstream API can be down for hours, and
+        a collector that gives up permanently turns a transient outage into
+        an indefinite one.  Instead the retry interval backs off
+        exponentially (capped) and the failure is escalated to CRITICAL and
+        reported to systemd once it stops looking transient.
+        """
         interval = self.args.interval or self.config['daemon']['interval']
-        logger.info("Starting SensorPush daemon (interval=%ds)", interval)
+        max_failures = int(self.config['daemon'].get(
+            'max_consecutive_failures', 0) or 0)
+        logger.info("Starting SensorPush daemon (interval=%ds, "
+                    "give up after=%s)", interval,
+                    max_failures if max_failures > 0 else 'never')
 
         # Connect to all backends (with retry)
         self._connect_writers()
 
         sd_notify('READY=1')
+        sd_status('Starting first collection cycle')
         self._start_watchdog()
 
         consecutive_failures = 0
-        max_consecutive_failures = 50
 
         while self.running:
             self._touch()
+            sleep_for = interval
             try:
                 self._collect_cycle()
                 consecutive_failures = 0
-                self._last_successful_time = datetime.datetime.now(
-                    tz=datetime.timezone.utc)
+                sd_status('OK: last successful cycle %s' %
+                          self._last_successful_time)
             except Exception as e:
                 consecutive_failures += 1
-                logger.error("Collection cycle failed (%d/%d): %s",
-                             consecutive_failures, max_consecutive_failures, e)
-                if consecutive_failures >= max_consecutive_failures:
+                # Exponential backoff, capped, so a multi-hour upstream
+                # outage costs a handful of requests rather than thousands.
+                sleep_for = min(interval * 2 ** min(consecutive_failures - 1, 8),
+                                MAX_CYCLE_BACKOFF)
+                log = (logger.critical if consecutive_failures >= CYCLE_ALERT_AFTER
+                       else logger.error)
+                log("Collection cycle failed (%d consecutive), retrying in "
+                    "%ds: %s", consecutive_failures, sleep_for, e)
+                sd_status('DEGRADED: %d consecutive failures: %s'
+                          % (consecutive_failures, e))
+                if max_failures > 0 and consecutive_failures >= max_failures:
                     logger.critical(
                         "Too many consecutive failures (%d), exiting",
                         consecutive_failures)
+                    sd_status('FATAL: giving up after %d consecutive failures'
+                              % consecutive_failures)
+                    self._exit_code = 1
+                    self.running = False
                     break
 
-            self._interruptible_sleep(interval)
+            self._interruptible_sleep(sleep_for)
 
+        self._save_state()
         for w in self.writers:
             try:
                 w.close()
             except Exception as e:
                 logger.warning("Error closing %s: %s", type(w).__name__, e)
         logger.info("Daemon stopped")
+        return self._exit_code
 
     def _connect_writers(self):
         """Connect all backend writers with retries. Fails only if ALL fail.
@@ -1215,8 +1510,10 @@ class SensorPushDaemon:
         currenttime = datetime.datetime.now(tz=mytz)
         measurement_name = self._get_measurement_name()
 
-        # Authenticate (or refresh token)
-        self.api.authenticate()
+        # Authenticate, reusing the cached token while it is still valid.
+        # Re-authenticating every cycle multiplied exposure to auth outages
+        # and cost ~11x the requests for no benefit.
+        self.api._ensure_auth()
 
         # Fetch and write voltage/RSSI data
         sensors = self.api.get_sensors()
@@ -1240,12 +1537,18 @@ class SensorPushDaemon:
             logger.warning("Failed to fetch reports: %s", e)
 
         # Determine time window (gap-filling in daemon mode)
+        deep_scan = False
         if self.args.daemon:
-            starttime, stoptime = self._compute_daemon_window(
+            starttime, stoptime, deep_scan = self._compute_daemon_window(
                 mytz, currenttime, sensors)
         else:
             starttime, stoptime = self._compute_oneshot_window(
                 mytz, currenttime)
+
+        # Re-drive any window that previously failed outright, before
+        # advancing anything - otherwise the hole is never revisited.
+        if self.args.daemon:
+            self._retry_failed_windows(sensors, measurement_name)
 
         timelist = build_timelist(starttime, stoptime, self.args.timestep)
         iterations = len(timelist)
@@ -1257,34 +1560,70 @@ class SensorPushDaemon:
         logger.info("Iterations required: %d", iterations)
 
         # Fetch and write samples
+        all_ok = True
+        wrote_any = False
         for i, window in enumerate(timelist, 1):
             if not self.running:
                 logger.info("Shutdown requested, stopping collection")
+                all_ok = False
                 break
-            self._fetch_and_write_window(
-                window, i, iterations, sensors, measurement_name)
+            if self._fetch_and_write_window(
+                    window, i, iterations, sensors, measurement_name):
+                wrote_any = True
+            else:
+                all_ok = False
+                self._record_failed_window(window)
         else:
-            # Loop ran to completion (not aborted by shutdown): record how
-            # far we got so the next cycle can poll incrementally from here.
-            if self.args.daemon:
+            # Loop ran to completion (not aborted by shutdown).  Only
+            # advance the high-water mark if every window actually landed;
+            # advancing past a failed window hides it from gap detection,
+            # which only ever looks at the newest stored point.
+            if self.args.daemon and all_ok:
                 self._fetch_high_water = stoptime
+
+        if wrote_any:
+            self._last_successful_time = datetime.datetime.now(
+                tz=datetime.timezone.utc)
+            self._write_last_success()
+
+        # Sensors lagging behind the rest are handled separately, and only
+        # on deep-scan cycles to keep the probe traffic bounded.
+        if self.args.daemon and deep_scan:
+            self._handle_sensor_returns(sensors, measurement_name, currenttime)
+            self._save_state()
+
+    def _gap_lookback_min(self):
+        """How far back gap-detection queries should search.
+
+        Must be at least as long as the gap being recovered, or the
+        lagging sensor looks like it has no data at all and back-filling
+        is silently skipped.  Derived from max_backfill (plus a wide
+        margin) so the two settings cannot disagree; 0 means unbounded.
+        """
+        cfg = self.config['daemon'].get('gap_lookback', '0')
+        if cfg and cfg != '0':
+            return parse_backlog(cfg)
+        max_backfill_str = self.config['daemon']['max_backfill']
+        if max_backfill_str and max_backfill_str != '0':
+            return parse_backlog(max_backfill_str) * 2
+        return 0
 
     def _compute_daemon_window(self, mytz, currenttime, sensors):
         """Compute time window for daemon mode.
 
+        Returns ``(starttime, stoptime, deep_scan_ran)``.
+
         Two modes:
 
-        * Deep scan - checks each sensor individually on each backend
-          (using the temperature metric as reference) and picks the
-          oldest timestamp found, so a sensor that stopped reporting has
-          its gap back-filled.  This is expensive and, while a sensor is
-          offline for a long time, would otherwise re-scan its entire
-          history on every cycle.
+        * Deep scan - queries every sensor on every backend to find how
+          far behind the *collector* is, i.e. the newest point each
+          backend holds.  Taking the newest (not the oldest) is what keeps
+          a single dead sensor from dragging the window across the entire
+          history on every scan; sensors lagging behind the pack are dealt
+          with individually by _handle_sensor_returns().
         * Incremental poll - between deep scans, simply continue from the
           high-water mark of the last completed cycle.  This keeps online
-          sensors current cheaply.  Any data buffered by a sensor that
-          comes back online is picked up by the next deep scan, which runs
-          at most every ``deep_scan_interval``.
+          sensors current cheaply.
         """
         poll_backlog_str = self.config['daemon']['poll_backlog']
         poll_backlog_min = parse_backlog(poll_backlog_str)
@@ -1292,6 +1631,7 @@ class SensorPushDaemon:
         max_backfill_min = parse_backlog(max_backfill_str) if max_backfill_str != '0' else 0
         deep_scan_str = self.config['daemon'].get('deep_scan_interval', '1h')
         deep_scan_min = parse_backlog(deep_scan_str) if deep_scan_str != '0' else 0
+        lookback_min = self._gap_lookback_min()
 
         # Decide whether a deep scan is due.  Always deep-scan on the first
         # cycle (no high-water mark yet) and when throttling is disabled.
@@ -1315,7 +1655,7 @@ class SensorPushDaemon:
             logger.info(
                 "Incremental poll from %s (deep scan in ~%.0f min)",
                 starttime.strftime('%Y-%m-%dT%X%z'), max(0, mins_to_deep))
-            return starttime, currenttime
+            return starttime, currenttime, False
 
         # --- deep scan ---
         self._last_deep_scan = now_mono
@@ -1325,20 +1665,23 @@ class SensorPushDaemon:
         # Build sensor ID list (same IDs used as tags in records)
         sensor_ids = list(sensors.keys())
 
-        # Find the oldest last-known timestamp across all sensors × backends
-        oldest_ts = None
-        oldest_info = None  # for logging: (sensor_id, writer_name)
+        # per_sensor[sid]  = oldest "last seen" across backends, i.e. the
+        #                    point from which that sensor still needs data
+        # per_writer[name] = newest "last seen" on that backend, i.e. how
+        #                    current the backend as a whole is
+        per_sensor = {}
+        per_writer = {}
 
         for writer in self.writers:
+            wname = type(writer).__name__
             if not writer.connected or writer._consecutive_failures > 0:
                 if not writer.connected:
                     logger.debug("Skipping gap check on %s (not connected)",
-                                 type(writer).__name__)
+                                 wname)
                 else:
                     logger.debug("Skipping gap check on %s "
                                  "(%d consecutive write failures)",
-                                 type(writer).__name__,
-                                 writer._consecutive_failures)
+                                 wname, writer._consecutive_failures)
                 continue
             for sid in sensor_ids:
                 if not self.running:
@@ -1348,32 +1691,43 @@ class SensorPushDaemon:
                 sid_tag = str(float(sid))
                 try:
                     ts = writer.get_last_timestamp(
-                        writer.measurement_name, sensor_id=sid_tag)
-                    if ts is not None:
-                        if ts.tzinfo is None:
-                            ts = ts.replace(tzinfo=datetime.timezone.utc)
-                        if oldest_ts is None or ts < oldest_ts:
-                            oldest_ts = ts
-                            oldest_info = (sid, type(writer).__name__)
+                        writer.measurement_name, sensor_id=sid_tag,
+                        lookback_min=lookback_min)
                 except Exception as e:
                     logger.warning(
                         "Could not query last timestamp for sensor %s "
-                        "from %s: %s", sid, type(writer).__name__, e)
+                        "from %s: %s", sid, wname, e)
+                    continue
+                if ts is None:
+                    continue
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=datetime.timezone.utc)
+                if sid not in per_sensor or ts < per_sensor[sid]:
+                    per_sensor[sid] = ts
+                if wname not in per_writer or ts > per_writer[wname]:
+                    per_writer[wname] = ts
 
-        if oldest_ts:
-            oldest_ts_local = oldest_ts.astimezone(mytz)
-            gap_minutes = (currenttime - oldest_ts_local).total_seconds() / 60
+        # Remember for _handle_sensor_returns(); local tz for logging.
+        self._sensor_last_stored = {
+            sid: ts.astimezone(mytz) for sid, ts in per_sensor.items()}
 
+        # The collector is only as current as its most-behind backend.
+        collector_ts = min(per_writer.values()) if per_writer else None
+        self._collector_high_water = (collector_ts.astimezone(mytz)
+                                      if collector_ts else None)
+
+        if collector_ts:
+            collector_local = collector_ts.astimezone(mytz)
+            gap_minutes = (currenttime - collector_local).total_seconds() / 60
             if gap_minutes > poll_backlog_min:
-                sensor_name = sensors.get(
-                    oldest_info[0], {}).get('name', oldest_info[0])
+                behind = min(per_writer, key=per_writer.get)
                 logger.info(
-                    "Gap detected: sensor '%s' on %s last seen at %s "
-                    "(%.0f min ago), fetching with 1h safety margin",
-                    sensor_name, oldest_info[1],
-                    oldest_ts_local.strftime('%Y-%m-%dT%X%z'), gap_minutes)
-                # Go back 1 hour before the oldest data point as safety margin
-                starttime = oldest_ts_local - datetime.timedelta(hours=1)
+                    "Collector gap: %s last stored data at %s (%.0f min ago), "
+                    "fetching with 1h safety margin",
+                    behind, collector_local.strftime('%Y-%m-%dT%X%z'),
+                    gap_minutes)
+                # Go back 1 hour before the last stored point as safety margin
+                starttime = collector_local - datetime.timedelta(hours=1)
             else:
                 starttime = currenttime - datetime.timedelta(
                     minutes=poll_backlog_min)
@@ -1388,14 +1742,175 @@ class SensorPushDaemon:
             earliest_allowed = currenttime - datetime.timedelta(
                 minutes=max_backfill_min)
             if starttime < earliest_allowed:
-                logger.info(
-                    "Capping backfill start from %s to %s (max_backfill=%s)",
+                logger.warning(
+                    "Capping backfill start from %s to %s (max_backfill=%s) - "
+                    "data older than the cap will not be recovered",
                     starttime.strftime('%Y-%m-%dT%X%z'),
                     earliest_allowed.strftime('%Y-%m-%dT%X%z'),
                     max_backfill_str)
                 starttime = earliest_allowed
 
-        return starttime, currenttime
+        return starttime, currenttime, True
+
+    def _handle_sensor_returns(self, sensors, measurement_name, currenttime):
+        """Back-fill sensors that have started reporting again.
+
+        A sensor can be out of range for weeks.  Its gateway only uploads
+        the buffered backlog once the sensor is back in range, and that
+        upload is not instant - so back-filling the moment the first new
+        sample appears would fetch a window the cloud has not finished
+        populating.  Instead: notice the return, wait
+        ``sensor_return_grace``, then fetch the sensor's whole gap once.
+
+        A sensor that is simply dead (flat battery) never produces new
+        data, so it costs exactly one cheap probe per deep scan and never
+        triggers a back-fill - which is what stops one dead sensor from
+        forcing a full-history refetch of everything, every hour.
+        """
+        per_sensor = getattr(self, '_sensor_last_stored', {})
+        collector_hw = getattr(self, '_collector_high_water', None)
+        if not per_sensor or collector_hw is None:
+            return
+
+        stale_str = self.config['daemon'].get('sensor_stale_after', '6h')
+        stale_after_min = parse_backlog(stale_str)
+        grace_str = self.config['daemon'].get('sensor_return_grace', '1h')
+        grace_sec = parse_backlog(grace_str) * 60 if grace_str != '0' else 0
+        now = time.time()
+
+        for sid, last_ts in per_sensor.items():
+            if not self.running:
+                return
+            name = sensors.get(sid, {}).get('name', sid)
+            lag_min = (collector_hw - last_ts).total_seconds() / 60
+            key = str(sid)
+
+            if lag_min <= stale_after_min:
+                # Within normal reporting jitter - nothing to do.
+                if self._sensor_state.pop(key, None):
+                    logger.info("Sensor '%s' is current again", name)
+                continue
+
+            if not self._sensor_has_new_data(sid, last_ts, currenttime):
+                if self._sensor_state.pop(key, None):
+                    logger.info("Sensor '%s' stopped reporting again before "
+                                "its back-fill ran; rearming", name)
+                else:
+                    logger.info(
+                        "Sensor '%s' has no new data (last seen %s, %.0f h "
+                        "behind); nothing to back-fill yet", name,
+                        last_ts.strftime('%Y-%m-%dT%X%z'), lag_min / 60)
+                continue
+
+            state = self._sensor_state.get(key)
+            if state is None:
+                self._sensor_state[key] = {
+                    'returned_at': now,
+                    'gap_from': last_ts.isoformat(),
+                }
+                logger.info(
+                    "Sensor '%s' is reporting again after %.1f h; waiting %s "
+                    "for its gateway to finish uploading before back-filling",
+                    name, lag_min / 60, grace_str)
+                continue
+
+            waited = now - float(state.get('returned_at', now))
+            # Small tolerance: probes happen once per deep scan, so an exact
+            # comparison would routinely miss by a second and push the
+            # back-fill out by a whole extra scan interval.
+            if waited < grace_sec - 60:
+                logger.info(
+                    "Sensor '%s' back-fill pending (%.0f of %.0f min settle "
+                    "time elapsed)", name, waited / 60, grace_sec / 60)
+                continue
+
+            logger.info("Sensor '%s' settled for %.0f min; back-filling from %s",
+                        name, waited / 60, last_ts.strftime('%Y-%m-%dT%X%z'))
+            if self._backfill_sensor(sid, last_ts, currenttime, sensors,
+                                     measurement_name):
+                self._sensor_state.pop(key, None)
+                logger.info("Sensor '%s' back-fill complete", name)
+            else:
+                logger.warning(
+                    "Sensor '%s' back-fill incomplete; will retry on the next "
+                    "deep scan", name)
+
+    def _sensor_has_new_data(self, sid, last_ts, currenttime):
+        """Cheap probe: does the cloud hold anything newer for this sensor?
+
+        The sensors endpoint carries no last-seen timestamp (``active``
+        and ``rssi`` stay stale on a dead sensor), so presence has to be
+        established with a one-sample query.  Starts just after the stored
+        point so an inclusive range cannot re-report it as new.
+        """
+        probe_start = last_ts + datetime.timedelta(seconds=1)
+        if probe_start >= currenttime:
+            return False
+        try:
+            self._touch()
+            samples = self.api.get_samples(
+                datetime.date.strftime(probe_start, '%Y-%m-%dT%X%z'),
+                datetime.date.strftime(currenttime, '%Y-%m-%dT%X%z'),
+                measures=['temperature'], limit=1, sensors=[str(sid)])
+            return int(samples.get('total_samples', 0)) > 0
+        except Exception as e:
+            logger.warning("Could not probe sensor %s for new data: %s", sid, e)
+            return False
+
+    def _backfill_sensor(self, sid, last_ts, currenttime, sensors,
+                         measurement_name):
+        """Fetch one sensor's whole gap. Returns True if every window landed."""
+        start = last_ts - datetime.timedelta(hours=1)
+        max_backfill_str = self.config['daemon']['max_backfill']
+        if max_backfill_str and max_backfill_str != '0':
+            earliest = currenttime - datetime.timedelta(
+                minutes=parse_backlog(max_backfill_str))
+            if start < earliest:
+                logger.warning(
+                    "Capping sensor back-fill start from %s to %s "
+                    "(max_backfill=%s)", start.strftime('%Y-%m-%dT%X%z'),
+                    earliest.strftime('%Y-%m-%dT%X%z'), max_backfill_str)
+                start = earliest
+        timelist = build_timelist(start, currenttime, self.args.timestep)
+        iterations = len(timelist)
+        logger.info("Sensor back-fill: %d iteration(s) from %s",
+                    iterations, start.strftime('%Y-%m-%dT%X%z'))
+        ok = True
+        for i, window in enumerate(timelist, 1):
+            if not self.running:
+                return False
+            if not self._fetch_and_write_window(
+                    window, i, iterations, sensors, measurement_name,
+                    sensor_filter=[str(sid)]):
+                ok = False
+        return ok
+
+    def _record_failed_window(self, window):
+        """Remember a window that could not be fetched, for a later retry."""
+        entry = list(window)
+        if entry not in self._failed_windows:
+            self._failed_windows.append(entry)
+            logger.error("Recorded failed window %s -> %s for retry "
+                         "(%d pending)", entry[0], entry[1],
+                         len(self._failed_windows))
+            self._save_state()
+
+    def _retry_failed_windows(self, sensors, measurement_name):
+        """Re-drive previously failed windows; drop them once they land."""
+        if not self._failed_windows:
+            return
+        pending = list(self._failed_windows)
+        logger.info("Retrying %d previously failed window(s)", len(pending))
+        for i, window in enumerate(pending, 1):
+            if not self.running:
+                return
+            if self._fetch_and_write_window(
+                    window, i, len(pending), sensors, measurement_name):
+                try:
+                    self._failed_windows.remove(window)
+                except ValueError:
+                    pass
+        self._save_state()
 
     def _compute_oneshot_window(self, mytz, currenttime):
         """Compute time window for one-shot mode (backward compatible)."""
@@ -1415,13 +1930,21 @@ class SensorPushDaemon:
         return starttime, stoptime
 
     def _fetch_and_write_window(self, window, iteration, iterations,
-                                sensors, measurement_name):
-        """Fetch samples for one time window and write to backend."""
+                                sensors, measurement_name, sensor_filter=None):
+        """Fetch samples for one time window and write to backend.
+
+        Returns True if the window was fetched and written, False if it
+        was abandoned after MAXRETRY attempts (daemon mode).  The caller
+        must not treat a False as progress - see _record_failed_window.
+        """
+        if sensor_filter is None:
+            sensor_filter = self.args.sensorlist
         retrycount = 0
         while True:
             try:
                 self._touch()
-                logger.info("Iteration %d/%d", iteration, iterations)
+                logger.info("Iteration %d/%d (%s -> %s)",
+                            iteration, iterations, window[0], window[1])
 
                 # The SensorPush API defaults to ~10 samples per sensor
                 # when no limit is specified.  In daemon mode we always
@@ -1434,7 +1957,7 @@ class SensorPushDaemon:
                     window[0], window[1],
                     measures=MEASURES,
                     limit=qlimit,
-                    sensors=self.args.sensorlist
+                    sensors=sensor_filter
                 )
 
                 truncated = samples['truncated']
@@ -1454,8 +1977,9 @@ class SensorPushDaemon:
 
                 if self.args.dryrun:
                     self._log_dryrun(records)
+                    written = True
                 else:
-                    self._safe_write(records)
+                    written = self._safe_write(records)
 
                 # Delay between iterations
                 if iterations > 1 and iteration < iterations:
@@ -1464,26 +1988,23 @@ class SensorPushDaemon:
                         self._interruptible_sleep(self.args.delay)
                     else:
                         time.sleep(self.args.delay)
-                return
+                return written
 
             except Exception as e:
                 retrycount += 1
-                logger.error("Error in iteration %d/%d: %s",
-                             iteration, iterations, e)
-                try:
-                    logger.debug("Last request status: %s", r.status_code)
-                    logger.debug("Last request headers: %s", r.headers)
-                    logger.debug("Last request content: %s",
-                                 r.content.decode('utf-8'))
-                except Exception:
-                    pass
+                logger.error("Error in iteration %d/%d (%s -> %s): %s",
+                             iteration, iterations, window[0], window[1], e)
 
                 if retrycount >= MAXRETRY:
                     if self.args.daemon:
+                        # Report the window, not just the index - the index
+                        # is meaningless once the cycle is over, and without
+                        # the bounds the lost range cannot be found again.
                         logger.error(
-                            "Max retries (%d) reached for iteration %d, "
-                            "skipping", MAXRETRY, iteration)
-                        return
+                            "Max retries (%d) reached for window %s -> %s, "
+                            "abandoning this attempt", MAXRETRY,
+                            window[0], window[1])
+                        return False
                     else:
                         logger.error(
                             "Max retries (%d) reached, stopping!",
@@ -1494,11 +2015,16 @@ class SensorPushDaemon:
                 self._interruptible_sleep(RETRYWAIT)
 
     def _safe_write(self, records):
-        """Write records to all backends with retry and reconnection."""
+        """Write records to all backends with retry and reconnection.
+
+        Returns True if at least one backend accepted the batch.  In
+        daemon mode a total failure is reported rather than raised, so
+        the caller can decline to advance the high-water mark.
+        """
         all_failed = True
         for writer in self.writers:
             if not self.running:
-                return
+                return not all_failed
 
             # If never connected or previously marked disconnected, try to connect
             if not writer.connected:
@@ -1515,7 +2041,7 @@ class SensorPushDaemon:
 
             for attempt, delay in enumerate([5, 10], 1):
                 if not self.running:
-                    return
+                    return not all_failed
                 try:
                     logger.debug("Writing %d records to %s (attempt %d)...",
                                  len(records), type(writer).__name__, attempt)
@@ -1550,6 +2076,7 @@ class SensorPushDaemon:
         if all_failed and not self.args.daemon:
             raise ConnectionError(
                 "Failed to write to any backend after 3 attempts")
+        return not all_failed
 
     def _log_dryrun(self, records):
         """Log records in dryrun mode."""
@@ -1654,17 +2181,27 @@ def main():
     # Load config
     config = load_config(config_path)
 
+    # Force IPv4 once for the whole process, before any connection is made.
+    if config['force_ipv4']:
+        if enable_force_ipv4():
+            logger.info("Forcing IPv4 for outbound connections")
+
     # Determine backend(s)
     if args.backend:
         backend_names = args.backend  # list from nargs='+'
     else:
         backend_names = [b.strip() for b in config['backend'].split(',')]
 
+    # Only silence certificate warnings if a backend actually opts out of
+    # verification, so a surprise on a verified connection still shows up.
+    if any(config.get(name) and not config[name].get('verify_ssl', True)
+           for name in ('influxdb2', 'influxdb3', 'victoriametrics')):
+        suppress_insecure_warnings()
+
     # Handle list-only commands
     if args.listsensors or args.listgateways:
         api = SensorPushAPI(config['login'], config['password'],
-                            verify_ssl=VERIFY_SSL,
-                            force_ipv4=config['force_ipv4'])
+                            verify_ssl=VERIFY_SSL)
         api.authenticate()
         if args.listgateways:
             display_gateways(api.get_gateways())
@@ -1674,19 +2211,20 @@ def main():
 
     # Create API client and writers
     api = SensorPushAPI(config['login'], config['password'],
-                        verify_ssl=VERIFY_SSL,
-                        force_ipv4=config['force_ipv4'])
+                        verify_ssl=VERIFY_SSL)
     logger.info("Active backend(s): %s", ', '.join(backend_names))
     writers = create_writers(backend_names, config)
 
     # Run
     daemon = SensorPushDaemon(api, writers, config, args)
+    # Route the API client's retry sleeps through the daemon so they stay
+    # interruptible and keep the watchdog heartbeat alive.
+    api.sleep = daemon._interruptible_sleep
 
     if args.daemon:
-        daemon.run()
-    else:
-        daemon.run_once()
+        return daemon.run()
 
+    daemon.run_once()
     return 0
 
 
