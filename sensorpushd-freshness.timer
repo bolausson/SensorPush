@@ -1,0 +1,14 @@
+[Unit]
+Description=Periodically check that sensorpushd is still storing data
+
+[Timer]
+# First check shortly after boot, then every 15 minutes.  With a 30-minute
+# staleness threshold this notices a stall within ~45 minutes - against the
+# 12 days the 2026-07-16 outage went unnoticed.
+OnBootSec=10min
+OnUnitActiveSec=15min
+AccuracySec=1min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

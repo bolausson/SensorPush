@@ -1,0 +1,13 @@
+[Unit]
+Description=Alert if sensorpushd has stopped storing data
+Documentation=man:sensorpushd
+
+[Service]
+Type=oneshot
+# Adjust the path to match your installation.
+ExecStart=/opt/sensorpush/sensorpushd-freshness.sh
+# Never let a stuck mail relay keep this check running until the next fire.
+TimeoutStartSec=60
+# Where to send the alert, and how stale is too stale.
+Environment=SENSORPUSHD_ALERT_TO=root
+Environment=SENSORPUSHD_MAX_AGE_MIN=30
