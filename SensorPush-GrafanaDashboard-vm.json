@@ -149,7 +149,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS_(VM)}"
           },
-          "expr": "SensorPush_temperature{sensor_name=~\"$sensors\"}",
+          "expr": "avg by (sensor_name) (SensorPush_temperature{sensor_name=~\"$sensors\"})",
           "legendFormat": "{{sensor_name}}",
           "refId": "A"
         }
@@ -268,7 +268,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS_(VM)}"
           },
-          "expr": "avg_over_time(SensorPush_temperature{sensor_name=~\"$sensors\"}[$__rate_interval])",
+          "expr": "avg by (sensor_name) (avg_over_time(SensorPush_temperature{sensor_name=~\"$sensors\"}[$__rate_interval]))",
           "legendFormat": "{{sensor_name}}",
           "refId": "A"
         }
@@ -394,7 +394,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS_(VM)}"
           },
-          "expr": "avg_over_time(SensorPush_humidity{sensor_name=~\"$sensors\"}[$__rate_interval])",
+          "expr": "avg by (sensor_name) (avg_over_time(SensorPush_humidity{sensor_name=~\"$sensors\"}[$__rate_interval]))",
           "legendFormat": "{{sensor_name}}",
           "refId": "A"
         },
@@ -403,7 +403,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS_(VM)}"
           },
-          "expr": "avg_over_time(SensorPush_abs_humidity{sensor_name=~\"$sensors\"}[$__rate_interval])",
+          "expr": "avg by (sensor_name) (avg_over_time(SensorPush_abs_humidity{sensor_name=~\"$sensors\"}[$__rate_interval]))",
           "hide": true,
           "legendFormat": "{{sensor_name}}",
           "refId": "B"
@@ -499,7 +499,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS_(VM)}"
           },
-          "expr": "avg_over_time(SensorPush_pressure{sensor_name=~\"$sensors\"}[$__rate_interval])",
+          "expr": "avg by (sensor_name) (avg_over_time(SensorPush_pressure{sensor_name=~\"$sensors\"}[$__rate_interval]))",
           "legendFormat": "{{sensor_name}}",
           "refId": "A"
         },
@@ -508,7 +508,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS_(VM)}"
           },
-          "expr": "avg_over_time(SensorPush_abs_humidity{sensor_name=~\"$sensors\"}[$__rate_interval])",
+          "expr": "avg by (sensor_name) (avg_over_time(SensorPush_abs_humidity{sensor_name=~\"$sensors\"}[$__rate_interval]))",
           "hide": true,
           "legendFormat": "{{sensor_name}}",
           "refId": "B"
@@ -614,7 +614,7 @@
                 "type": "prometheus",
                 "uid": "${DS_PROMETHEUS_(VM)}"
               },
-              "expr": "avg_over_time(SensorPush_dewpoint{sensor_name=~\"$sensors\"}[$__rate_interval])",
+              "expr": "avg by (sensor_name) (avg_over_time(SensorPush_dewpoint{sensor_name=~\"$sensors\"}[$__rate_interval]))",
               "legendFormat": "{{sensor_name}}",
               "refId": "A"
             }
@@ -709,7 +709,7 @@
                 "type": "prometheus",
                 "uid": "${DS_PROMETHEUS_(VM)}"
               },
-              "expr": "avg_over_time(SensorPush_abs_humidity{sensor_name=~\"$sensors\"}[$__rate_interval])",
+              "expr": "avg by (sensor_name) (avg_over_time(SensorPush_abs_humidity{sensor_name=~\"$sensors\"}[$__rate_interval]))",
               "legendFormat": "{{sensor_name}}",
               "refId": "A"
             }
@@ -804,7 +804,7 @@
                 "type": "prometheus",
                 "uid": "${DS_PROMETHEUS_(VM)}"
               },
-              "expr": "avg_over_time(SensorPush_vpd{sensor_name=~\"$sensors\"}[$__rate_interval])",
+              "expr": "avg by (sensor_name) (avg_over_time(SensorPush_vpd{sensor_name=~\"$sensors\"}[$__rate_interval]))",
               "legendFormat": "{{sensor_name}}",
               "refId": "A"
             }
@@ -899,7 +899,7 @@
                 "type": "prometheus",
                 "uid": "${DS_PROMETHEUS_(VM)}"
               },
-              "expr": "avg_over_time(SensorPush_altitude{sensor_name=~\"$sensors\"}[$__rate_interval])",
+              "expr": "avg by (sensor_name) (avg_over_time(SensorPush_altitude{sensor_name=~\"$sensors\"}[$__rate_interval]))",
               "legendFormat": "{{sensor_name}}",
               "refId": "A"
             }
@@ -1013,7 +1013,7 @@
                 "type": "prometheus",
                 "uid": "${DS_PROMETHEUS_(VM)}"
               },
-              "expr": "avg_over_time(SensorPush_V_voltage{sensor_name=~\"$sensors\"}[$__rate_interval])",
+              "expr": "avg by (sensor_name) (avg_over_time(SensorPush_V_voltage{sensor_name=~\"$sensors\"}[$__rate_interval]))",
               "legendFormat": "{{sensor_name}}",
               "refId": "A"
             }
@@ -1111,7 +1111,7 @@
                 "type": "prometheus",
                 "uid": "${DS_PROMETHEUS_(VM)}"
               },
-              "expr": "avg_over_time(SensorPush_V_rssi{sensor_name=~\"$sensors\"}[$__rate_interval])",
+              "expr": "avg by (sensor_name) (avg_over_time(SensorPush_V_rssi{sensor_name=~\"$sensors\"}[$__rate_interval]))",
               "legendFormat": "{{sensor_name}}",
               "refId": "A"
             }
