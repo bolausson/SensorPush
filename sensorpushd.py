@@ -832,8 +832,12 @@ class VMWriter(BaseWriter):
     def get_last_timestamp(self, measurement_name, sensor_id=None,
                            lookback_min=0):
         try:
-            # Use last_over_time() which is standard MetricsQL.  The response
-            # timestamp in the [value] array tells us when the last point was.
+            # tlast_over_time() (MetricsQL, VictoriaMetrics >= v1.52) returns
+            # the time of the newest raw sample as its *value*, value[1].
+            # The timestamp in value[0] is only the query's evaluation time
+            # - "now" - so reading it (as last_over_time() did here) made
+            # every stored series look current: an outage was never
+            # back-filled and a silent sensor was never noticed.
             sensor_filter = ''
             if sensor_id is not None:
                 sensor_filter = f'sensor_id="{sensor_id}"'
@@ -842,7 +846,7 @@ class VMWriter(BaseWriter):
             # MetricsQL has no unbounded lookbehind; 10y stands in for
             # "no limit" and comfortably exceeds any real retention.
             window = f'{int(lookback_min)}m' if lookback_min else '10y'
-            query_str = f'last_over_time({metric}{{{sensor_filter}}}[{window}])'
+            query_str = f'tlast_over_time({metric}{{{sensor_filter}}}[{window}])'
             response = self.session.get(
                 url,
                 params={'query': query_str},
@@ -855,8 +859,8 @@ class VMWriter(BaseWriter):
             if results:
                 # One result per label set, so a renamed sensor yields
                 # several series under the same sensor_id - take the
-                # newest, not the first.  [0] = unix timestamp, [1] = value
-                ts = max(float(r['value'][0]) for r in results)
+                # newest, not the first.
+                ts = max(float(r['value'][1]) for r in results)
                 return datetime.datetime.fromtimestamp(
                     ts, tz=datetime.timezone.utc)
             return None
