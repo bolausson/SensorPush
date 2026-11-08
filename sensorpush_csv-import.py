@@ -96,7 +96,13 @@ parser.add_argument(
     default='',
     type=str,
     required=True,
-    help='Sensor id')
+    help='Sensor id, in the form your collector stores it, so the import '
+    'lands in the same series: sensorpush.py stores the full SensorPush id, '
+    'sensorpushd.py and sensorpush2.py store str(float(id)) - see --float-id')
+parser.add_argument(
+    '--float-id', dest='float_id', action='store_true',
+    help='Store the id the way sensorpushd.py and sensorpush2.py do, '
+    'str(float(id)), e.g. 123456.7890123456789012 -> 123456.78901234567')
 parser.add_argument(
     '-d', '--dryrun', dest='dryrun', action="store_true",
     help='Do not write anything to InfluxDB -\
@@ -116,13 +122,18 @@ sensorid = args.sensorid
 dryrun = args.dryrun
 chunks = args.chunks
 
+if args.float_id and sensorid:
+    sensorid = str(float(sensorid))
+    print(f'Storing sensor id as {sensorid}')
+
 if not sensorname:
     print("You must specify a sensor name!")
     sys.exit(0)
     #sensorname = os.path.splitext(csvfile)[0]
 
 if not sensorid:
-    print("You must specify the sensor ID e.g.: 123456.123456789012345!")
+    print("You must specify the sensor ID e.g.: 123456.7890123456789012 "
+          "(add --float-id for sensorpushd.py / sensorpush2.py data)!")
     sys.exit(0)
     # sensorid = str(uuid.uuid4())
     #sensorid = sensorname

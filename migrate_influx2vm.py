@@ -36,17 +36,23 @@ Examples:
   %(prog)s --all                              # Migrate all data
   %(prog)s --start 2024-01-01 --end 2024-12-31
   %(prog)s --start 2024-01-01 --end 2024-12-31 --dry-run
-  %(prog)s --start -30d --end now
+  %(prog)s --start=-30d --end now     # relative times need the '=' form
   %(prog)s --ifdb-config /path/to/ifdb.conf --vm-config /path/to/vm.conf --all
+  %(prog)s --config /etc/sensorpushd.conf --all --dry-run
 """
 )
 
+parser.add_argument('-c', '--config', dest='config', default=None,
+                    help='Read both databases from a unified sensorpushd.py config '
+                         '([INFLUXDB2] and [VICTORIAMETRICS] sections) instead of '
+                         '--ifdb-config/--vm-config')
 parser.add_argument('--ifdb-config', dest='ifdb_config', default=default_ifdb_config,
                     help=f'Path to InfluxDB configuration file (default: {default_ifdb_config})')
 parser.add_argument('--vm-config', dest='vm_config', default=default_vm_config,
                     help=f'Path to VictoriaMetrics configuration file (default: {default_vm_config})')
 parser.add_argument('--start', dest='start_time', default=None,
-                    help='Start time for migration (e.g., 2024-01-01, -30d, -1y)')
+                    help='Start time for migration (e.g., 2024-01-01, or a relative '
+                         'time written as --start=-30d / --start=-1y)')
 parser.add_argument('--end', dest='end_time', default='now',
                     help='End time for migration (e.g., 2024-12-31, now) (default: now)')
 parser.add_argument('--all', dest='migrate_all', action='store_true', default=False,
@@ -71,33 +77,65 @@ if not args.start_time and not args.migrate_all:
 if args.migrate_all:
     args.start_time = '1970-01-01'
 
-# Read InfluxDB configuration
-if not Path(args.ifdb_config).is_file():
-    print(f'Error: InfluxDB configuration file not found: {args.ifdb_config}', file=sys.stderr)
-    sys.exit(1)
+def with_port(url, port):
+    """Append the port unless the URL already names one (as sensorpushd.py does)."""
+    host_part = url.split('://', 1)[-1]
+    return url if ':' in host_part else f'{url}:{port}'
 
-ifdb_config = configparser.ConfigParser()
-ifdb_config.read(args.ifdb_config)
 
-IFDB_URL = ifdb_config['INFLUXDBCONF']['IFDB_URL']
-IFDB_PORT = ifdb_config['INFLUXDBCONF']['IFDB_PORT']
-IFDB_ORG = ifdb_config['INFLUXDBCONF']['IFDB_ORG']
-IFDB_BUCKET = ifdb_config['INFLUXDBCONF']['IFDB_BUCKET']
-IFDB_TOKEN = ifdb_config['INFLUXDBCONF']['IFDB_TOKEN']
-IFDB_VERIFY_SSL = ifdb_config['INFLUXDBCONF'].get('IFDB_VERIFY_SSL', 'True').lower() in ['true', '1']
-MEASUREMENT_NAME = ifdb_config['INFLUXDBCONF']['MEASUREMENT_NAME']
+if args.config:
+    # Unified sensorpushd.py config
+    if not Path(args.config).is_file():
+        print(f'Error: configuration file not found: {args.config}', file=sys.stderr)
+        sys.exit(1)
+    unified = configparser.ConfigParser()
+    unified.read(args.config)
+    for section in ('INFLUXDB2', 'VICTORIAMETRICS'):
+        if section not in unified:
+            print(f'Error: [{section}] section missing in {args.config}', file=sys.stderr)
+            sys.exit(1)
+    i2 = unified['INFLUXDB2']
+    IFDB_BASE_URL = i2.get('URL', 'http://localhost:8086')
+    if i2.get('PORT'):
+        IFDB_BASE_URL = with_port(IFDB_BASE_URL, i2['PORT'])
+    IFDB_ORG = i2.get('ORG', '')
+    IFDB_BUCKET = i2.get('BUCKET', 'sensorpush')
+    IFDB_TOKEN = i2.get('TOKEN', '')
+    IFDB_VERIFY_SSL = i2.getboolean('VERIFY_SSL', fallback=False)
+    MEASUREMENT_NAME = i2.get('MEASUREMENT_NAME', 'SensorPush')
+    vm = unified['VICTORIAMETRICS']
+    VM_URL = vm.get('URL', 'http://localhost:8428')
+    VM_VERIFY_SSL = vm.getboolean('VERIFY_SSL', fallback=False)
+    VM_MEASUREMENT_NAME = vm.get('MEASUREMENT_NAME', 'SensorPush')
+else:
+    # Read InfluxDB configuration
+    if not Path(args.ifdb_config).is_file():
+        print(f'Error: InfluxDB configuration file not found: {args.ifdb_config}', file=sys.stderr)
+        sys.exit(1)
 
-# Read VictoriaMetrics configuration
-if not Path(args.vm_config).is_file():
-    print(f'Error: VictoriaMetrics configuration file not found: {args.vm_config}', file=sys.stderr)
-    sys.exit(1)
+    ifdb_config = configparser.ConfigParser()
+    ifdb_config.read(args.ifdb_config)
 
-vm_config = configparser.ConfigParser()
-vm_config.read(args.vm_config)
+    IFDB_URL = ifdb_config['INFLUXDBCONF']['IFDB_URL']
+    IFDB_PORT = ifdb_config['INFLUXDBCONF']['IFDB_PORT']
+    IFDB_BASE_URL = with_port(IFDB_URL, IFDB_PORT)
+    IFDB_ORG = ifdb_config['INFLUXDBCONF']['IFDB_ORG']
+    IFDB_BUCKET = ifdb_config['INFLUXDBCONF']['IFDB_BUCKET']
+    IFDB_TOKEN = ifdb_config['INFLUXDBCONF']['IFDB_TOKEN']
+    IFDB_VERIFY_SSL = ifdb_config['INFLUXDBCONF'].get('IFDB_VERIFY_SSL', 'True').lower() in ['true', '1']
+    MEASUREMENT_NAME = ifdb_config['INFLUXDBCONF']['MEASUREMENT_NAME']
 
-VM_URL = vm_config['VICTORIAMETRICSCONF']['VM_URL']
-VM_VERIFY_SSL = vm_config['VICTORIAMETRICSCONF'].get('VM_VERIFY_SSL', 'False').lower() in ['true', '1']
-VM_MEASUREMENT_NAME = vm_config['VICTORIAMETRICSCONF']['MEASUREMENT_NAME']
+    # Read VictoriaMetrics configuration
+    if not Path(args.vm_config).is_file():
+        print(f'Error: VictoriaMetrics configuration file not found: {args.vm_config}', file=sys.stderr)
+        sys.exit(1)
+
+    vm_config = configparser.ConfigParser()
+    vm_config.read(args.vm_config)
+
+    VM_URL = vm_config['VICTORIAMETRICSCONF']['VM_URL']
+    VM_VERIFY_SSL = vm_config['VICTORIAMETRICSCONF'].get('VM_VERIFY_SSL', 'False').lower() in ['true', '1']
+    VM_MEASUREMENT_NAME = vm_config['VICTORIAMETRICSCONF']['MEASUREMENT_NAME']
 
 VM_IMPORT_URL = f'{VM_URL}/api/v1/import'
 
@@ -123,7 +161,7 @@ start_time = parse_time_arg(args.start_time)
 end_time = parse_time_arg(args.end_time)
 
 print(f'Migration settings:')
-print(f'  InfluxDB: {IFDB_URL}:{IFDB_PORT}, bucket: {IFDB_BUCKET}')
+print(f'  InfluxDB: {IFDB_BASE_URL}, bucket: {IFDB_BUCKET}')
 print(f'  VictoriaMetrics: {VM_URL}')
 print(f'  Source measurement: {MEASUREMENT_NAME}')
 print(f'  Target measurement: {VM_MEASUREMENT_NAME}')
@@ -135,7 +173,7 @@ print()
 # Connect to InfluxDB
 print('Connecting to InfluxDB...')
 ifdbc = InfluxDBClient(
-    url=f'{IFDB_URL}:{IFDB_PORT}',
+    url=IFDB_BASE_URL,
     token=IFDB_TOKEN,
     org=IFDB_ORG,
     verify_ssl=IFDB_VERIFY_SSL,
@@ -179,11 +217,23 @@ def write_to_victoriametrics(datapoints):
         print(f'Error writing to VictoriaMetrics: {e}', file=sys.stderr)
         return False
 
+# Tag columns copied as VictoriaMetrics labels.  sensor_uid only exists on
+# points written with SENSOR_UID enabled; it is numeric-looking, so without
+# this it would be turned into a bogus "<measurement>_sensor_uid" metric.
+LABEL_KEYS = ('sensor_id', 'sensor_name', 'sensor_uid')
+
+
+def record_labels(values):
+    """Labels for one pivoted InfluxDB record: its tag values as strings."""
+    return {key: str(values[key]) for key in LABEL_KEYS
+            if values.get(key) is not None}
+
+
 def process_records(tables, vm_datapoints, total_records, total_datapoints, batches_written):
     """Process InfluxDB records and write to VictoriaMetrics"""
-    # SensorPush excluded keys (metadata fields, not actual measurements)
+    # SensorPush excluded keys (metadata and tag columns, not measurements)
     excluded_keys = {'_start', '_stop', '_time', '_measurement', 'result', 'table',
-                     'sensor_id', 'sensor_name', '_field', '_value'}
+                     '_field', '_value', *LABEL_KEYS}
 
     for table in tables:
         for record in table.records:
@@ -200,11 +250,7 @@ def process_records(tables, vm_datapoints, total_records, total_datapoints, batc
                 target_measurement = f'{VM_MEASUREMENT_NAME}_V'
 
             # Extract SensorPush tags
-            tags = {}
-            if 'sensor_id' in record.values:
-                tags['sensor_id'] = str(record.values['sensor_id'])
-            if 'sensor_name' in record.values:
-                tags['sensor_name'] = str(record.values['sensor_name'])
+            tags = record_labels(record.values)
 
             # Extract all numeric fields (dynamically)
             for field_name, field_value in record.values.items():
@@ -288,7 +334,7 @@ if use_chunking and args.migrate_all:
     ifdb_database = IFDB_BUCKET.split('/')[0] if '/' in IFDB_BUCKET else IFDB_BUCKET
 
     influxql_query = f'SELECT * FROM "{MEASUREMENT_NAME}" ORDER BY time ASC LIMIT 1'
-    influxql_url = f'{IFDB_URL}:{IFDB_PORT}/query'
+    influxql_url = f'{IFDB_BASE_URL}/query'
 
     if args.verbose:
         print(f'  Query: {influxql_query}')
