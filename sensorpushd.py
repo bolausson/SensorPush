@@ -249,6 +249,7 @@ def _load_legacy_influxdb2(config):
             'org': config['INFLUXDBCONF']['IFDB_ORG'],
             'bucket': config['INFLUXDBCONF']['IFDB_BUCKET'],
             'verify_ssl': config['INFLUXDBCONF'].get('IFDB_VERIFY_SSL', 'False').lower() in ('true', '1', 'yes'),
+            'sensor_uid': config['INFLUXDBCONF'].getboolean('SENSOR_UID', fallback=False),
         },
         'influxdb3': None,
         'victoriametrics': None,
@@ -271,6 +272,7 @@ def _load_legacy_vm(config):
             'measurement_name': config['VICTORIAMETRICSCONF'].get('MEASUREMENT_NAME', 'SensorPush'),
             'url': config['VICTORIAMETRICSCONF'].get('VM_URL', 'http://localhost:8428'),
             'verify_ssl': config['VICTORIAMETRICSCONF'].getboolean('VM_VERIFY_SSL', False),
+            'sensor_uid': config['VICTORIAMETRICSCONF'].getboolean('SENSOR_UID', fallback=False),
         },
         'daemon': dict(DEFAULT_DAEMON_CFG),
     }
@@ -325,6 +327,7 @@ def _load_unified(config):
             'org': config.get('INFLUXDB2', 'ORG', fallback=''),
             'bucket': config.get('INFLUXDB2', 'BUCKET', fallback='sensorpush'),
             'verify_ssl': config.getboolean('INFLUXDB2', 'VERIFY_SSL', fallback=False),
+            'sensor_uid': config.getboolean('INFLUXDB2', 'SENSOR_UID', fallback=False),
         }
 
     if 'INFLUXDB3' in config:
@@ -339,6 +342,7 @@ def _load_unified(config):
             'database': config.get('INFLUXDB3', 'DATABASE', fallback='sensorpush'),
             'token': config.get('INFLUXDB3', 'TOKEN', fallback=''),
             'verify_ssl': config.getboolean('INFLUXDB3', 'VERIFY_SSL', fallback=False),
+            'sensor_uid': config.getboolean('INFLUXDB3', 'SENSOR_UID', fallback=False),
         }
 
     if 'VICTORIAMETRICS' in config:
@@ -346,6 +350,7 @@ def _load_unified(config):
             'measurement_name': config.get('VICTORIAMETRICS', 'MEASUREMENT_NAME', fallback='SensorPush'),
             'url': config.get('VICTORIAMETRICS', 'URL', fallback='http://localhost:8428'),
             'verify_ssl': config.getboolean('VICTORIAMETRICS', 'VERIFY_SSL', fallback=False),
+            'sensor_uid': config.getboolean('VICTORIAMETRICS', 'SENSOR_UID', fallback=False),
         }
 
     return cfg
@@ -365,6 +370,14 @@ PASSWORD = SensorPush password
 # All backends are written with the MEASUREMENT_NAME of the first one.
 TYPE = victoriametrics
 
+# Each backend section accepts SENSOR_UID.  When True, every point written to
+# that backend also carries the full SensorPush sensor id as the tag
+# sensor_uid.  sensor_id itself never changes (it stays str(float(id)), see
+# the README), so existing queries keep working, but enabling it starts one
+# new series per sensor, just like renaming a sensor does.  Read the README
+# section "Storing the full sensor id" before enabling it on a database
+# that already holds data.
+
 [INFLUXDB2]
 MEASUREMENT_NAME = SensorPush
 URL = http://localhost:8086
@@ -372,6 +385,7 @@ TOKEN = your_influxdb2_token
 ORG = your_org
 BUCKET = sensorpush
 VERIFY_SSL = False
+SENSOR_UID = False
 
 [INFLUXDB3]
 MEASUREMENT_NAME = SensorPush
@@ -379,11 +393,13 @@ URL = http://localhost:8181
 DATABASE = sensorpush
 TOKEN = your_influxdb3_token
 VERIFY_SSL = False
+SENSOR_UID = False
 
 [VICTORIAMETRICS]
 MEASUREMENT_NAME = SensorPush
 URL = http://localhost:8428
 VERIFY_SSL = False
+SENSOR_UID = False
 
 [DAEMON]
 INTERVAL = 300
@@ -569,6 +585,61 @@ def parse_timestamp_to_ms(timestamp):
 
 
 # -----------------------------------------------------------------------------
+# Stored sensor ids
+# -----------------------------------------------------------------------------
+# The sensor_id tag has always been written as str(float(<API id>)): Python's
+# shortest repr of the nearest double.  SensorPush ids carry about 20
+# significant digits and a double keeps 15-17, so the stored value is a
+# shortened form of the id, e.g.
+#
+#     '123456.7890123456789012' -> '123456.78901234567'
+#
+# The part before the dot (the deviceId) is always kept in full.  The
+# mapping is deterministic, so any API id can be turned into its stored
+# value; `sensorpushd.py -l` prints both.
+#
+# Do not change this format.  Every existing series, every user query and
+# alert filtering on sensor_id, and the daemon's own gap detection (which
+# looks up the newest stored point by this value) depend on it.  A different
+# value starts new series and makes the gap check blind to all existing
+# data.  The full id can be stored *in addition*, as the opt-in sensor_uid
+# tag (SENSOR_UID in a backend's config section).
+_non_numeric_ids_reported = set()
+
+
+def sensor_id_tag(api_id):
+    """Return the sensor_id tag value stored for a SensorPush API id.
+
+    A non-numeric id (none is known to exist) is stored unchanged rather
+    than failing the whole batch, and reported once.
+    """
+    try:
+        value = float(api_id)
+    except (TypeError, ValueError):
+        value = None
+    if value is None or not math.isfinite(value):
+        if api_id not in _non_numeric_ids_reported:
+            _non_numeric_ids_reported.add(api_id)
+            logger.error("Sensor id %r is not numeric; storing it unchanged "
+                         "as sensor_id", api_id)
+        return str(api_id)
+    return str(value)
+
+
+def find_sensor_id_collisions(sensor_ids):
+    """Return {stored sensor_id: [API ids]} for values shared by several ids.
+
+    Two ids collide only if they round to the same double, which needs the
+    same deviceId and the same first 8-12 digits after the dot - not a
+    practical risk, but cheap to check.
+    """
+    by_tag = {}
+    for sid in sensor_ids:
+        by_tag.setdefault(sensor_id_tag(sid), []).append(str(sid))
+    return {tag: sorted(ids) for tag, ids in by_tag.items() if len(ids) > 1}
+
+
+# -----------------------------------------------------------------------------
 # Backend Writers
 # -----------------------------------------------------------------------------
 class BaseWriter(ABC):
@@ -577,6 +648,8 @@ class BaseWriter(ABC):
     def __init__(self):
         self._connected = False
         self._consecutive_failures = 0
+        # Opt-in (SENSOR_UID): also store the full API id as tag sensor_uid.
+        self.sensor_uid = False
 
     @property
     def connected(self):
@@ -640,6 +713,7 @@ class InfluxDB2Writer(BaseWriter):
         self.bucket = config['bucket']
         self.verify_ssl = config['verify_ssl']
         self.measurement_name = config['measurement_name']
+        self.sensor_uid = bool(config.get('sensor_uid', False))
         self.client = None
         self.write_api = None
         self.query_api = None
@@ -683,10 +757,10 @@ class InfluxDB2Writer(BaseWriter):
         # window is still found.
         start = f'-{int(lookback_min)}m' if lookback_min else '1970-01-01T00:00:00Z'
         # last() runs per series, which is index-cheap.  A sensor that
-        # was ever renamed has one series per name under the same
-        # sensor_id, so this returns several rows - take the newest.
-        # (Collapsing with group()+sort() in Flux instead would sort the
-        # entire history: ~26s across 18 sensors versus ~1s.)
+        # was ever renamed (or has SENSOR_UID switched on) has several
+        # series under the same sensor_id, so this returns several rows -
+        # take the newest.  (Collapsing with group()+sort() in Flux instead
+        # would sort the entire history: ~26s across 18 sensors versus ~1s.)
         query = (
             f'from(bucket: "{self.bucket}")'
             f' |> range(start: {start})'
@@ -724,6 +798,7 @@ class InfluxDB3Writer(BaseWriter):
         self.token = config['token']
         self.verify_ssl = config.get('verify_ssl', False)
         self.measurement_name = config['measurement_name']
+        self.sensor_uid = bool(config.get('sensor_uid', False))
         self.client = None
 
     def connect(self):
@@ -827,6 +902,7 @@ class VMWriter(BaseWriter):
         self.url = config['url']
         self.verify_ssl = config['verify_ssl']
         self.measurement_name = config['measurement_name']
+        self.sensor_uid = bool(config.get('sensor_uid', False))
         self.session = None
 
     def connect(self):
@@ -905,8 +981,9 @@ class VMWriter(BaseWriter):
         results = data.get('data', {}).get('result', [])
         if not results:
             return None
-        # One result per label set, so a renamed sensor yields several
-        # series under the same sensor_id - take the newest, not the first.
+        # One result per label set, so a renamed sensor (or one with
+        # SENSOR_UID switched on) yields several series under the same
+        # sensor_id - take the newest, not the first.
         ts = max(float(r['value'][1]) for r in results)
         return datetime.datetime.fromtimestamp(ts, tz=datetime.timezone.utc)
 
@@ -1106,7 +1183,7 @@ def build_voltage_records(sensors, measurement_name, querytime):
         records.append({
             'measurement': str(measurement_v_name),
             'tags': {
-                'sensor_id': float(sensors[sid]["id"]),
+                'sensor_id': sensor_id_tag(sensors[sid]["id"]),
                 'sensor_name': str(sensors[sid]["name"]),
             },
             'fields': {
@@ -1130,7 +1207,7 @@ def process_samples(samples, sensors, measurement_name, my_altitude, noconvert):
             m = {
                 'measurement': str(measurement_name),
                 'tags': {
-                    'sensor_id': float(key),
+                    'sensor_id': sensor_id_tag(key),
                     'sensor_name': str(sensor_name),
                 },
                 'fields': {},
@@ -1282,6 +1359,11 @@ class SensorPushDaemon:
         # backends cannot be asked for their newest point - see
         # _known_collected_until().
         self._collected_until = None
+        # (stored sensor_id, sensor_name) -> full API id, refreshed every
+        # cycle, for backends with SENSOR_UID enabled.
+        self._sensor_uids = {}
+        self._reported_collisions = set()
+        self._logged_id_map = False
         self._state_path = self._resolve_state_path()
         self._load_state()
         self._setup_signals()
@@ -1302,6 +1384,12 @@ class SensorPushDaemon:
                 "are written as '%s', the first backend's name",
                 ', '.join(f'{k}={v}' for k, v in names),
                 self._get_measurement_name())
+        for w in self.writers:
+            if getattr(w, 'sensor_uid', False):
+                logger.info(
+                    "%s: SENSOR_UID is on - every point also stores the full "
+                    "SensorPush id as tag sensor_uid (sensor_id is unchanged)",
+                    type(w).__name__)
 
     # -- persistent state ---------------------------------------------------
 
@@ -1681,6 +1769,7 @@ class SensorPushDaemon:
 
         # Fetch and write voltage/RSSI data
         sensors = self.api.get_sensors()
+        self._note_sensors(sensors)
         logger.info("Building voltage records for %d sensors", len(sensors))
         voltage_records = build_voltage_records(
             sensors, measurement_name, currenttime)
@@ -1755,6 +1844,44 @@ class SensorPushDaemon:
 
         if state_dirty:
             self._save_state()
+
+    def _note_sensors(self, sensors):
+        """Per-cycle bookkeeping for the account's current sensor list.
+
+        Refreshes the sensor_uid lookup, reports sensors whose stored
+        sensor_id would collide (never changes what is stored), and once
+        per process logs which sensor_id each sensor is stored under.
+        """
+        by_tag = {}
+        by_record = {}
+        for sid in sensors:
+            tag = sensor_id_tag(sid)
+            by_tag.setdefault(tag, []).append(str(sid))
+            # Records carry sensor_id and sensor_name, so that pair finds
+            # the full id - also for two sensors whose sensor_id collides.
+            key = (tag, str(sensors[sid].get('name', '')))
+            by_record.setdefault(key, []).append(str(sid))
+        # Only a pair shared by several ids (same stored id *and* same
+        # name) cannot be attributed; it gets no sensor_uid, not a wrong one.
+        self._sensor_uids = {key: ids[0] for key, ids in by_record.items()
+                             if len(ids) == 1}
+        for tag, ids in sorted(by_tag.items()):
+            key = (tag, tuple(sorted(ids)))
+            if len(ids) < 2 or key in self._reported_collisions:
+                continue
+            self._reported_collisions.add(key)
+            logger.error(
+                "Sensors %s are all stored as sensor_id=%s. Queries that "
+                "filter on sensor_id, and the daemon's gap check, cannot tell "
+                "them apart; sensor_name still does. SENSOR_UID=True stores "
+                "the full ids as well. Nothing stored has been changed.",
+                ', '.join(sorted(ids)), tag)
+        if not self._logged_id_map and self.args.daemon:
+            self._logged_id_map = True
+            for sid in sorted(sensors, key=lambda s: str(sensors[s].get('name', s))):
+                logger.info("Sensor '%s': API id %s is stored as sensor_id=%s",
+                            sensors[sid].get('name', sid), sid,
+                            sensor_id_tag(sid))
 
     def _gap_lookback_min(self):
         """How far back gap-detection queries should search.
@@ -1865,8 +1992,10 @@ class SensorPushDaemon:
                 if not self.running:
                     break
                 self._touch()
-                # sensor_id tag is stored as float(key), e.g. "1234567.0"
-                sid_tag = str(float(sid))
+                # Query by the value the sensor is stored under - the same
+                # sensor_id_tag() the record builders use - never by the
+                # raw API id.
+                sid_tag = sensor_id_tag(sid)
                 try:
                     ts = writer.get_last_timestamp(
                         measurement_name, sensor_id=sid_tag,
@@ -2289,6 +2418,7 @@ class SensorPushDaemon:
                                    type(writer).__name__, e)
                     continue  # skip this backend for this cycle
 
+            backend_records = self._records_for(writer, records)
             for attempt, delay in enumerate([5, 10], 1):
                 if not self.running:
                     return not all_failed
@@ -2296,7 +2426,7 @@ class SensorPushDaemon:
                     logger.debug("Writing %d records to %s (attempt %d)...",
                                  len(records), type(writer).__name__, attempt)
                     t0 = time.time()
-                    writer.write(records)
+                    writer.write(backend_records)
                     logger.info("Write to %s OK (%d records, %.1fs)",
                                 type(writer).__name__, len(records),
                                 time.time() - t0)
@@ -2328,9 +2458,37 @@ class SensorPushDaemon:
                 "Failed to write to any backend after 3 attempts")
         return not all_failed
 
+    def _records_for(self, writer, records):
+        """The records as this backend stores them.
+
+        The very same objects unless the backend has SENSOR_UID on; then
+        each point also carries the full SensorPush id as tag sensor_uid.
+        sensor_id itself never changes, so the gap check (which filters on
+        sensor_id) sees old and new series alike.
+        """
+        if not getattr(writer, 'sensor_uid', False):
+            return records
+        out = []
+        for r in records:
+            uid = self._sensor_uids.get((str(r['tags'].get('sensor_id')),
+                                         str(r['tags'].get('sensor_name'))))
+            if uid is None:
+                out.append(r)
+            else:
+                out.append(dict(r, tags=dict(r['tags'], sensor_uid=uid)))
+        return out
+
     def _log_dryrun(self, records):
-        """Log records in dryrun mode."""
-        logger.info("--- Data that would have been written ---")
+        """Log records in dryrun mode, as each backend would store them."""
+        if not any(getattr(w, 'sensor_uid', False) for w in self.writers):
+            self._log_records(records, '')
+            return
+        for writer in self.writers:
+            self._log_records(self._records_for(writer, records),
+                              f' to {type(writer).__name__}')
+
+    def _log_records(self, records, target):
+        logger.info("--- Data that would have been written%s ---", target)
         if self.args.verbose:
             for r in records:
                 logger.info("%s", r)
@@ -2371,10 +2529,14 @@ def display_gateways(gateways):
         print('')
 
 
-def display_sensors(sensors):
+def display_sensors(sensors, sensor_uid=False):
+    """Print every sensor, including the tag values its data is stored under."""
     for sid in sensors.keys():
         sensorname = sensors[sid]["name"]
         print(f'---------------{sensorname}---------------')
+        print(f'stored as sensor_id: {sensor_id_tag(sid)}')
+        if sensor_uid:
+            print(f'stored as sensor_uid: {sid}')
         for key in sensors[sid].keys():
             print(f'{key}: {sensors[sid][key]}')
         try:
@@ -2387,6 +2549,9 @@ def display_sensors(sensors):
             print(f'Failed to get rssi for {sensors[sid]["name"]}')
         print('------------------------------------------------------------')
         print('')
+    for tag, ids in find_sensor_id_collisions(sensors).items():
+        print(f'WARNING: sensors {", ".join(ids)} are all stored as '
+              f'sensor_id={tag}; sensor_id alone cannot tell them apart')
 
 
 # -----------------------------------------------------------------------------
@@ -2397,6 +2562,15 @@ def main():
 
     # Setup logging
     setup_logging(level=args.loglevel, log_file=args.logfile)
+
+    # The stored sensor_id is str(float(id)), which every CPython since 3.2
+    # renders the same way ('short' repr).  A build without it would store
+    # different values and start new series.
+    if sys.float_repr_style != 'short':
+        logger.warning(
+            "This Python uses %r float repr; stored sensor_id values may "
+            "differ from those written by a standard CPython build",
+            sys.float_repr_style)
 
     # Generate config and exit if requested
     if args.generate_config is not None:
@@ -2456,7 +2630,9 @@ def main():
         if args.listgateways:
             display_gateways(api.get_gateways())
         if args.listsensors:
-            display_sensors(api.get_sensors())
+            display_sensors(api.get_sensors(), sensor_uid=any(
+                (config.get(name) or {}).get('sensor_uid')
+                for name in backend_names))
         return 0
 
     # Create API client and writers
