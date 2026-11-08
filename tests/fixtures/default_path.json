@@ -1,0 +1,164 @@
+{
+ "generated_from": "master sensorpushd.py (29de9d9), before the issue-9 changes",
+ "inputs": {
+  "sensors": {
+   "12345.6789012345678901": {
+    "id": "12345.6789012345678901",
+    "name": "Room 0",
+    "battery_voltage": 2.9,
+    "rssi": -60
+   },
+   "234567.8901234567890123": {
+    "id": "234567.8901234567890123",
+    "name": "Room 1",
+    "battery_voltage": null,
+    "rssi": -61
+   },
+   "16777301.2345678901234567": {
+    "id": "16777301.2345678901234567",
+    "name": "Room 2",
+    "battery_voltage": 2.92,
+    "rssi": -62
+   },
+   "123456.7890123456789012": {
+    "id": "123456.7890123456789012",
+    "name": "Room 3",
+    "battery_voltage": 2.9299999999999997,
+    "rssi": -63
+   },
+   "12345678.9012345678901": {
+    "id": "12345678.9012345678901",
+    "name": "Room 4",
+    "battery_voltage": 2.94,
+    "rssi": -64
+   }
+  },
+  "samples": {
+   "sensors": {
+    "12345.6789012345678901": [
+     {
+      "observed": "2026-11-08T10:00:00.000Z",
+      "temperature": 70.1,
+      "humidity": 45.5
+     },
+     {
+      "observed": "2026-11-08T10:01:00.000Z",
+      "temperature": 70.3,
+      "humidity": 45.2
+     }
+    ],
+    "234567.8901234567890123": [
+     {
+      "observed": "2026-11-08T10:00:30.000Z",
+      "temperature": 39.0,
+      "humidity": 80.0,
+      "barometric_pressure": 29.92,
+      "altitude": 330.0,
+      "dewpoint": 33.5,
+      "vpd": 0.15
+     }
+    ],
+    "16777301.2345678901234567": [
+     {
+      "observed": "2026-11-08T10:02:00.000Z",
+      "temperature": -4.0,
+      "humidity": 60.0,
+      "distance": 12.0
+     }
+    ],
+    "123456.7890123456789012": [
+     {
+      "observed": "2026-11-08T10:03:00.000Z",
+      "temperature": 50.0,
+      "humidity": 99.0
+     }
+    ],
+    "12345678.9012345678901": [
+     {
+      "observed": "2026-11-08T10:04:00.000Z",
+      "temperature": 85.0,
+      "humidity": 20.0
+     }
+    ]
+   }
+  },
+  "querytime": "2026-11-08T11:00:00+0100",
+  "my_altitude": 42.0
+ },
+ "influxdb2_line_protocol": [
+  "SensorPush_V,sensor_id=12345.678901234567,sensor_name=Room\\ 0 rssi=-60,voltage=2.9 1794132000000000000",
+  "SensorPush_V,sensor_id=234567.89012345677,sensor_name=Room\\ 1 rssi=-61,voltage=0 1794132000000000000",
+  "SensorPush_V,sensor_id=16777301.23456789,sensor_name=Room\\ 2 rssi=-62,voltage=2.92 1794132000000000000",
+  "SensorPush_V,sensor_id=123456.78901234567,sensor_name=Room\\ 3 rssi=-63,voltage=2.9299999999999997 1794132000000000000",
+  "SensorPush_V,sensor_id=12345678.901234567,sensor_name=Room\\ 4 rssi=-64,voltage=2.94 1794132000000000000",
+  "SensorPush,sensor_id=12345.678901234567,sensor_name=Room\\ 0 abs_humidity=8.42,altitude=42,dewpoint=8.94,humidity=45.5,temperature=21.17,vpd=13.62 1794132000000000000",
+  "SensorPush,sensor_id=12345.678901234567,sensor_name=Room\\ 0 abs_humidity=8.41,altitude=42,dewpoint=8.94,humidity=45.2,temperature=21.28,vpd=13.79 1794132060000000000",
+  "SensorPush,sensor_id=234567.89012345677,sensor_name=Room\\ 1 abs_humidity=5.08,altitude=100.58,dewpoint=0.83,humidity=80,pressure=1013.21,temperature=3.89,vpd=1.5 1794132030000000000",
+  "SensorPush,sensor_id=16777301.23456789,sensor_name=Room\\ 2 abs_humidity=0.65,altitude=42,dewpoint=-25.73,distance=3.66,humidity=60,temperature=-20,vpd=0.5 1794132120000000000",
+  "SensorPush,sensor_id=123456.78901234567,sensor_name=Room\\ 3 abs_humidity=9.3,altitude=42,dewpoint=9.85,humidity=99,temperature=10,vpd=0.12 1794132180000000000",
+  "SensorPush,sensor_id=12345678.901234567,sensor_name=Room\\ 4 abs_humidity=5.89,altitude=42,dewpoint=4.15,humidity=20,temperature=29.44,vpd=32.63 1794132240000000000"
+ ],
+ "influxdb3_line_protocol": [
+  "SensorPush_V,sensor_id=12345.678901234567,sensor_name=Room\\ 0 rssi=-60,voltage=2.9 1794132000000000000",
+  "SensorPush_V,sensor_id=234567.89012345677,sensor_name=Room\\ 1 rssi=-61,voltage=0 1794132000000000000",
+  "SensorPush_V,sensor_id=16777301.23456789,sensor_name=Room\\ 2 rssi=-62,voltage=2.92 1794132000000000000",
+  "SensorPush_V,sensor_id=123456.78901234567,sensor_name=Room\\ 3 rssi=-63,voltage=2.9299999999999997 1794132000000000000",
+  "SensorPush_V,sensor_id=12345678.901234567,sensor_name=Room\\ 4 rssi=-64,voltage=2.94 1794132000000000000",
+  "SensorPush,sensor_id=12345.678901234567,sensor_name=Room\\ 0 abs_humidity=8.42,altitude=42,dewpoint=8.94,humidity=45.5,temperature=21.17,vpd=13.62 1794132000000000000",
+  "SensorPush,sensor_id=12345.678901234567,sensor_name=Room\\ 0 abs_humidity=8.41,altitude=42,dewpoint=8.94,humidity=45.2,temperature=21.28,vpd=13.79 1794132060000000000",
+  "SensorPush,sensor_id=234567.89012345677,sensor_name=Room\\ 1 abs_humidity=5.08,altitude=100.58,dewpoint=0.83,humidity=80,pressure=1013.21,temperature=3.89,vpd=1.5 1794132030000000000",
+  "SensorPush,sensor_id=16777301.23456789,sensor_name=Room\\ 2 abs_humidity=0.65,altitude=42,dewpoint=-25.73,distance=3.66,humidity=60,temperature=-20,vpd=0.5 1794132120000000000",
+  "SensorPush,sensor_id=123456.78901234567,sensor_name=Room\\ 3 abs_humidity=9.3,altitude=42,dewpoint=9.85,humidity=99,temperature=10,vpd=0.12 1794132180000000000",
+  "SensorPush,sensor_id=12345678.901234567,sensor_name=Room\\ 4 abs_humidity=5.89,altitude=42,dewpoint=4.15,humidity=20,temperature=29.44,vpd=32.63 1794132240000000000"
+ ],
+ "victoriametrics_json": [
+  "{\"metric\": {\"__name__\": \"SensorPush_V_voltage\", \"sensor_id\": \"12345.678901234567\", \"sensor_name\": \"Room 0\"}, \"values\": [2.9], \"timestamps\": [1794132000000]}",
+  "{\"metric\": {\"__name__\": \"SensorPush_V_rssi\", \"sensor_id\": \"12345.678901234567\", \"sensor_name\": \"Room 0\"}, \"values\": [-60.0], \"timestamps\": [1794132000000]}",
+  "{\"metric\": {\"__name__\": \"SensorPush_V_voltage\", \"sensor_id\": \"234567.89012345677\", \"sensor_name\": \"Room 1\"}, \"values\": [0.0], \"timestamps\": [1794132000000]}",
+  "{\"metric\": {\"__name__\": \"SensorPush_V_rssi\", \"sensor_id\": \"234567.89012345677\", \"sensor_name\": \"Room 1\"}, \"values\": [-61.0], \"timestamps\": [1794132000000]}",
+  "{\"metric\": {\"__name__\": \"SensorPush_V_voltage\", \"sensor_id\": \"16777301.23456789\", \"sensor_name\": \"Room 2\"}, \"values\": [2.92], \"timestamps\": [1794132000000]}",
+  "{\"metric\": {\"__name__\": \"SensorPush_V_rssi\", \"sensor_id\": \"16777301.23456789\", \"sensor_name\": \"Room 2\"}, \"values\": [-62.0], \"timestamps\": [1794132000000]}",
+  "{\"metric\": {\"__name__\": \"SensorPush_V_voltage\", \"sensor_id\": \"123456.78901234567\", \"sensor_name\": \"Room 3\"}, \"values\": [2.9299999999999997], \"timestamps\": [1794132000000]}",
+  "{\"metric\": {\"__name__\": \"SensorPush_V_rssi\", \"sensor_id\": \"123456.78901234567\", \"sensor_name\": \"Room 3\"}, \"values\": [-63.0], \"timestamps\": [1794132000000]}",
+  "{\"metric\": {\"__name__\": \"SensorPush_V_voltage\", \"sensor_id\": \"12345678.901234567\", \"sensor_name\": \"Room 4\"}, \"values\": [2.94], \"timestamps\": [1794132000000]}",
+  "{\"metric\": {\"__name__\": \"SensorPush_V_rssi\", \"sensor_id\": \"12345678.901234567\", \"sensor_name\": \"Room 4\"}, \"values\": [-64.0], \"timestamps\": [1794132000000]}",
+  "{\"metric\": {\"__name__\": \"SensorPush_humidity\", \"sensor_id\": \"12345.678901234567\", \"sensor_name\": \"Room 0\"}, \"values\": [45.5], \"timestamps\": [1794132000000]}",
+  "{\"metric\": {\"__name__\": \"SensorPush_temperature\", \"sensor_id\": \"12345.678901234567\", \"sensor_name\": \"Room 0\"}, \"values\": [21.17], \"timestamps\": [1794132000000]}",
+  "{\"metric\": {\"__name__\": \"SensorPush_abs_humidity\", \"sensor_id\": \"12345.678901234567\", \"sensor_name\": \"Room 0\"}, \"values\": [8.42], \"timestamps\": [1794132000000]}",
+  "{\"metric\": {\"__name__\": \"SensorPush_altitude\", \"sensor_id\": \"12345.678901234567\", \"sensor_name\": \"Room 0\"}, \"values\": [42.0], \"timestamps\": [1794132000000]}",
+  "{\"metric\": {\"__name__\": \"SensorPush_dewpoint\", \"sensor_id\": \"12345.678901234567\", \"sensor_name\": \"Room 0\"}, \"values\": [8.94], \"timestamps\": [1794132000000]}",
+  "{\"metric\": {\"__name__\": \"SensorPush_vpd\", \"sensor_id\": \"12345.678901234567\", \"sensor_name\": \"Room 0\"}, \"values\": [13.62], \"timestamps\": [1794132000000]}",
+  "{\"metric\": {\"__name__\": \"SensorPush_humidity\", \"sensor_id\": \"12345.678901234567\", \"sensor_name\": \"Room 0\"}, \"values\": [45.2], \"timestamps\": [1794132060000]}",
+  "{\"metric\": {\"__name__\": \"SensorPush_temperature\", \"sensor_id\": \"12345.678901234567\", \"sensor_name\": \"Room 0\"}, \"values\": [21.28], \"timestamps\": [1794132060000]}",
+  "{\"metric\": {\"__name__\": \"SensorPush_abs_humidity\", \"sensor_id\": \"12345.678901234567\", \"sensor_name\": \"Room 0\"}, \"values\": [8.41], \"timestamps\": [1794132060000]}",
+  "{\"metric\": {\"__name__\": \"SensorPush_altitude\", \"sensor_id\": \"12345.678901234567\", \"sensor_name\": \"Room 0\"}, \"values\": [42.0], \"timestamps\": [1794132060000]}",
+  "{\"metric\": {\"__name__\": \"SensorPush_dewpoint\", \"sensor_id\": \"12345.678901234567\", \"sensor_name\": \"Room 0\"}, \"values\": [8.94], \"timestamps\": [1794132060000]}",
+  "{\"metric\": {\"__name__\": \"SensorPush_vpd\", \"sensor_id\": \"12345.678901234567\", \"sensor_name\": \"Room 0\"}, \"values\": [13.79], \"timestamps\": [1794132060000]}",
+  "{\"metric\": {\"__name__\": \"SensorPush_humidity\", \"sensor_id\": \"234567.89012345677\", \"sensor_name\": \"Room 1\"}, \"values\": [80.0], \"timestamps\": [1794132030000]}",
+  "{\"metric\": {\"__name__\": \"SensorPush_temperature\", \"sensor_id\": \"234567.89012345677\", \"sensor_name\": \"Room 1\"}, \"values\": [3.89], \"timestamps\": [1794132030000]}",
+  "{\"metric\": {\"__name__\": \"SensorPush_pressure\", \"sensor_id\": \"234567.89012345677\", \"sensor_name\": \"Room 1\"}, \"values\": [1013.21], \"timestamps\": [1794132030000]}",
+  "{\"metric\": {\"__name__\": \"SensorPush_abs_humidity\", \"sensor_id\": \"234567.89012345677\", \"sensor_name\": \"Room 1\"}, \"values\": [5.08], \"timestamps\": [1794132030000]}",
+  "{\"metric\": {\"__name__\": \"SensorPush_altitude\", \"sensor_id\": \"234567.89012345677\", \"sensor_name\": \"Room 1\"}, \"values\": [100.58], \"timestamps\": [1794132030000]}",
+  "{\"metric\": {\"__name__\": \"SensorPush_dewpoint\", \"sensor_id\": \"234567.89012345677\", \"sensor_name\": \"Room 1\"}, \"values\": [0.83], \"timestamps\": [1794132030000]}",
+  "{\"metric\": {\"__name__\": \"SensorPush_vpd\", \"sensor_id\": \"234567.89012345677\", \"sensor_name\": \"Room 1\"}, \"values\": [1.5], \"timestamps\": [1794132030000]}",
+  "{\"metric\": {\"__name__\": \"SensorPush_humidity\", \"sensor_id\": \"16777301.23456789\", \"sensor_name\": \"Room 2\"}, \"values\": [60.0], \"timestamps\": [1794132120000]}",
+  "{\"metric\": {\"__name__\": \"SensorPush_temperature\", \"sensor_id\": \"16777301.23456789\", \"sensor_name\": \"Room 2\"}, \"values\": [-20.0], \"timestamps\": [1794132120000]}",
+  "{\"metric\": {\"__name__\": \"SensorPush_abs_humidity\", \"sensor_id\": \"16777301.23456789\", \"sensor_name\": \"Room 2\"}, \"values\": [0.65], \"timestamps\": [1794132120000]}",
+  "{\"metric\": {\"__name__\": \"SensorPush_altitude\", \"sensor_id\": \"16777301.23456789\", \"sensor_name\": \"Room 2\"}, \"values\": [42.0], \"timestamps\": [1794132120000]}",
+  "{\"metric\": {\"__name__\": \"SensorPush_distance\", \"sensor_id\": \"16777301.23456789\", \"sensor_name\": \"Room 2\"}, \"values\": [3.66], \"timestamps\": [1794132120000]}",
+  "{\"metric\": {\"__name__\": \"SensorPush_dewpoint\", \"sensor_id\": \"16777301.23456789\", \"sensor_name\": \"Room 2\"}, \"values\": [-25.73], \"timestamps\": [1794132120000]}",
+  "{\"metric\": {\"__name__\": \"SensorPush_vpd\", \"sensor_id\": \"16777301.23456789\", \"sensor_name\": \"Room 2\"}, \"values\": [0.5], \"timestamps\": [1794132120000]}",
+  "{\"metric\": {\"__name__\": \"SensorPush_humidity\", \"sensor_id\": \"123456.78901234567\", \"sensor_name\": \"Room 3\"}, \"values\": [99.0], \"timestamps\": [1794132180000]}",
+  "{\"metric\": {\"__name__\": \"SensorPush_temperature\", \"sensor_id\": \"123456.78901234567\", \"sensor_name\": \"Room 3\"}, \"values\": [10.0], \"timestamps\": [1794132180000]}",
+  "{\"metric\": {\"__name__\": \"SensorPush_abs_humidity\", \"sensor_id\": \"123456.78901234567\", \"sensor_name\": \"Room 3\"}, \"values\": [9.3], \"timestamps\": [1794132180000]}",
+  "{\"metric\": {\"__name__\": \"SensorPush_altitude\", \"sensor_id\": \"123456.78901234567\", \"sensor_name\": \"Room 3\"}, \"values\": [42.0], \"timestamps\": [1794132180000]}",
+  "{\"metric\": {\"__name__\": \"SensorPush_dewpoint\", \"sensor_id\": \"123456.78901234567\", \"sensor_name\": \"Room 3\"}, \"values\": [9.85], \"timestamps\": [1794132180000]}",
+  "{\"metric\": {\"__name__\": \"SensorPush_vpd\", \"sensor_id\": \"123456.78901234567\", \"sensor_name\": \"Room 3\"}, \"values\": [0.12], \"timestamps\": [1794132180000]}",
+  "{\"metric\": {\"__name__\": \"SensorPush_humidity\", \"sensor_id\": \"12345678.901234567\", \"sensor_name\": \"Room 4\"}, \"values\": [20.0], \"timestamps\": [1794132240000]}",
+  "{\"metric\": {\"__name__\": \"SensorPush_temperature\", \"sensor_id\": \"12345678.901234567\", \"sensor_name\": \"Room 4\"}, \"values\": [29.44], \"timestamps\": [1794132240000]}",
+  "{\"metric\": {\"__name__\": \"SensorPush_abs_humidity\", \"sensor_id\": \"12345678.901234567\", \"sensor_name\": \"Room 4\"}, \"values\": [5.89], \"timestamps\": [1794132240000]}",
+  "{\"metric\": {\"__name__\": \"SensorPush_altitude\", \"sensor_id\": \"12345678.901234567\", \"sensor_name\": \"Room 4\"}, \"values\": [42.0], \"timestamps\": [1794132240000]}",
+  "{\"metric\": {\"__name__\": \"SensorPush_dewpoint\", \"sensor_id\": \"12345678.901234567\", \"sensor_name\": \"Room 4\"}, \"values\": [4.15], \"timestamps\": [1794132240000]}",
+  "{\"metric\": {\"__name__\": \"SensorPush_vpd\", \"sensor_id\": \"12345678.901234567\", \"sensor_name\": \"Room 4\"}, \"values\": [32.63], \"timestamps\": [1794132240000]}"
+ ]
+}
