@@ -351,60 +351,68 @@ def _load_unified(config):
     return cfg
 
 
+# Written as text rather than through ConfigParser, which would drop the
+# comments and lower-case the keys.  Full-line comments only: values must
+# not carry inline comments, ConfigParser would read them as part of the
+# value.
+DEFAULT_CONFIG_TEMPLATE = """\
+[SENSORPUSHAPI]
+LOGIN = SensorPush login (email)
+PASSWORD = SensorPush password
+
+[BACKEND]
+# One or more of: influxdb2, influxdb3, victoriametrics (comma-separated).
+# All backends are written with the MEASUREMENT_NAME of the first one.
+TYPE = victoriametrics
+
+[INFLUXDB2]
+MEASUREMENT_NAME = SensorPush
+URL = http://localhost:8086
+TOKEN = your_influxdb2_token
+ORG = your_org
+BUCKET = sensorpush
+VERIFY_SSL = False
+
+[INFLUXDB3]
+MEASUREMENT_NAME = SensorPush
+URL = http://localhost:8181
+DATABASE = sensorpush
+TOKEN = your_influxdb3_token
+VERIFY_SSL = False
+
+[VICTORIAMETRICS]
+MEASUREMENT_NAME = SensorPush
+URL = http://localhost:8428
+VERIFY_SSL = False
+
+[DAEMON]
+INTERVAL = 300
+POLL_BACKLOG = 10m
+# 0 = back-fill without limit.  Raising this off 0 caps how far the
+# daemon can recover after a long outage - see GAP_LOOKBACK too.
+MAX_BACKFILL = 0
+DEEP_SCAN_INTERVAL = 1h
+# 0 = never stop collecting; back off exponentially instead.
+MAX_CONSECUTIVE_FAILURES = 0
+# Settle time before back-filling a sensor that started reporting again.
+SENSOR_RETURN_GRACE = 1h
+# 0 = search the full history when locating existing data.
+GAP_LOOKBACK = 0
+# How far a sensor may lag the others before it counts as missing.
+SENSOR_STALE_AFTER = 6h
+
+[MISC]
+MY_ALTITUDE = 0.0
+# Set to True on networks where IPv6 to api.sensorpush.com blackholes
+# (symptom: connections hang for minutes instead of failing fast).
+FORCE_IPv4 = False
+"""
+
+
 def create_default_config(path):
     """Write a default config template."""
-    config = configparser.ConfigParser()
-    config['SENSORPUSHAPI'] = {
-        'LOGIN': 'SensorPush login (email)',
-        'PASSWORD': 'SensorPush password',
-    }
-    config['BACKEND'] = {
-        'TYPE': 'victoriametrics',
-    }
-    config['INFLUXDB2'] = {
-        'MEASUREMENT_NAME': 'SensorPush',
-        'URL': 'http://localhost:8086',
-        'TOKEN': 'your_influxdb2_token',
-        'ORG': 'your_org',
-        'BUCKET': 'sensorpush',
-        'VERIFY_SSL': 'False',
-    }
-    config['INFLUXDB3'] = {
-        'MEASUREMENT_NAME': 'SensorPush',
-        'URL': 'http://localhost:8181',
-        'DATABASE': 'sensorpush',
-        'TOKEN': 'your_influxdb3_token',
-        'VERIFY_SSL': 'False',
-    }
-    config['VICTORIAMETRICS'] = {
-        'MEASUREMENT_NAME': 'SensorPush',
-        'URL': 'http://localhost:8428',
-        'VERIFY_SSL': 'False',
-    }
-    config['DAEMON'] = {
-        'INTERVAL': '300',
-        'POLL_BACKLOG': '10m',
-        # 0 = back-fill without limit.  Raising this off 0 caps how far the
-        # daemon can recover after a long outage - see GAP_LOOKBACK too.
-        'MAX_BACKFILL': '0',
-        'DEEP_SCAN_INTERVAL': '1h',
-        # 0 = never stop collecting; back off exponentially instead.
-        'MAX_CONSECUTIVE_FAILURES': '0',
-        # Settle time before back-filling a sensor that started reporting again.
-        'SENSOR_RETURN_GRACE': '1h',
-        # 0 = search the full history when locating existing data.
-        'GAP_LOOKBACK': '0',
-        # How far a sensor may lag the others before it counts as missing.
-        'SENSOR_STALE_AFTER': '6h',
-    }
-    config['MISC'] = {
-        'MY_ALTITUDE': '0.0',
-        # Set to True on networks where IPv6 to api.sensorpush.com blackholes
-        # (symptom: connections hang for minutes instead of failing fast).
-        'FORCE_IPv4': 'False',
-    }
     with open(path, 'w') as f:
-        config.write(f)
+        f.write(DEFAULT_CONFIG_TEMPLATE)
 
 
 # -----------------------------------------------------------------------------
@@ -1277,6 +1285,23 @@ class SensorPushDaemon:
         self._state_path = self._resolve_state_path()
         self._load_state()
         self._setup_signals()
+        self._report_writer_settings()
+
+    def _report_writer_settings(self):
+        """Point out per-backend settings that do not do what they look like."""
+        names = [(type(w).__name__, w.measurement_name) for w in self.writers]
+        if len({name for _, name in names}) > 1:
+            # Records are built once and written to every backend, so they
+            # all get the first backend's name.  The gap check therefore
+            # queries that name on every backend too (it used to query each
+            # backend's own name, found nothing, and silently stopped
+            # back-filling there).  Writing each backend under its own name
+            # instead would move existing data to a new measurement.
+            logger.warning(
+                "MEASUREMENT_NAME differs between backends (%s); all backends "
+                "are written as '%s', the first backend's name",
+                ', '.join(f'{k}={v}' for k, v in names),
+                self._get_measurement_name())
 
     # -- persistent state ---------------------------------------------------
 
@@ -1365,9 +1390,10 @@ class SensorPushDaemon:
         Process supervision cannot see the failure mode that matters most
         - a daemon that is alive but storing nothing - so this timestamp
         is what the freshness check alerts on.  Only written when a write
-        genuinely succeeded, never merely when a cycle did not raise.
+        genuinely succeeded, never merely when a cycle did not raise - and
+        never in dry-run mode, where nothing is written at all.
         """
-        if not self._state_path:
+        if not self._state_path or self.args.dryrun:
             return
         try:
             path = self._state_path.parent / 'last-success'
@@ -1423,8 +1449,12 @@ class SensorPushDaemon:
         return self._collected_until
 
     def _save_state(self):
-        """Persist state atomically so a crash mid-write cannot corrupt it."""
-        if not self._state_path:
+        """Persist state atomically so a crash mid-write cannot corrupt it.
+
+        Never in dry-run mode: a dry run must leave pending back-fills,
+        failed windows and the collection mark exactly as it found them.
+        """
+        if not self._state_path or self.args.dryrun:
             return
         payload = {
             'sensors': self._sensor_state,
@@ -1434,6 +1464,7 @@ class SensorPushDaemon:
             'collected_until': (self._collected_until.isoformat()
                                 if self._collected_until is not None else None),
         }
+        tmp = None
         try:
             fd, tmp = tempfile.mkstemp(dir=str(self._state_path.parent),
                                        prefix='.state-', suffix='.tmp')
@@ -1443,6 +1474,13 @@ class SensorPushDaemon:
         except Exception as e:
             logger.warning("Could not write state file %s: %s",
                            self._state_path, e)
+            # Saves happen every cycle; on a full disk, leftover temp files
+            # would pile up.
+            if tmp is not None:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
 
     def _setup_signals(self):
         signal.signal(signal.SIGTERM, self._handle_signal)
@@ -1788,8 +1826,16 @@ class SensorPushDaemon:
         logger.info("Running deep gap scan (deep_scan_interval=%s)",
                     deep_scan_str)
 
-        # Build sensor ID list (same IDs used as tags in records)
+        # The sensors to check: the API ids, limited to --sensorlist when
+        # one is given (otherwise an excluded sensor with old data would be
+        # tracked as stale and back-filled anyway).
         sensor_ids = list(sensors.keys())
+        if self.args.sensorlist:
+            wanted = {str(s) for s in self.args.sensorlist}
+            sensor_ids = [sid for sid in sensor_ids if str(sid) in wanted]
+        # Look up the measurement the records are actually written to -
+        # the first backend's name, on every backend.
+        measurement_name = self._get_measurement_name()
 
         # per_sensor[sid]  = oldest "last seen" across backends, i.e. the
         #                    point from which that sensor still needs data
@@ -1823,7 +1869,7 @@ class SensorPushDaemon:
                 sid_tag = str(float(sid))
                 try:
                     ts = writer.get_last_timestamp(
-                        writer.measurement_name, sensor_id=sid_tag,
+                        measurement_name, sensor_id=sid_tag,
                         lookback_min=lookback_min)
                 except Exception as e:
                     failed += 1
