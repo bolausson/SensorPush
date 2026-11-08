@@ -31,6 +31,7 @@
 #
 
 import os
+import re
 import sys
 import json
 import time
@@ -597,7 +598,11 @@ class BaseWriter(ABC):
         full history.  A bound shorter than the actual gap makes the
         sensor look like it has no data at all, which silently disables
         back-filling - so the caller derives it from max_backfill.
-        Returns a datetime object or None if no data exists.
+
+        Returns a datetime, or None if the backend holds no matching data.
+        Raises if the backend could not be asked: a failed lookup must
+        never look like "no data", because the caller would then fetch
+        only the poll backlog and silently drop an outage.
         """
         pass
 
@@ -659,41 +664,37 @@ class InfluxDB2Writer(BaseWriter):
 
     def get_last_timestamp(self, measurement_name, sensor_id=None,
                            lookback_min=0):
-        try:
-            sensor_filter = ''
-            if sensor_id is not None:
-                sensor_filter = (
-                    f' |> filter(fn: (r) => r.sensor_id == "{sensor_id}")'
-                )
-            # 0 = unbounded: start from the Unix epoch rather than a
-            # relative window, so a sensor stale for longer than the
-            # window is still found.
-            start = f'-{int(lookback_min)}m' if lookback_min else '1970-01-01T00:00:00Z'
-            # last() runs per series, which is index-cheap.  A sensor that
-            # was ever renamed has one series per name under the same
-            # sensor_id, so this returns several rows - the caller takes the
-            # newest.  (Collapsing with group()+sort() in Flux instead would
-            # sort the entire history: ~26s across 18 sensors versus ~1s.)
-            query = (
-                f'from(bucket: "{self.bucket}")'
-                f' |> range(start: {start})'
-                f' |> filter(fn: (r) => r._measurement == "{measurement_name}"'
-                f'    and r._field == "temperature")'
-                f'{sensor_filter}'
-                f' |> last()'
+        # Errors propagate on purpose - see BaseWriter.get_last_timestamp.
+        sensor_filter = ''
+        if sensor_id is not None:
+            sensor_filter = (
+                f' |> filter(fn: (r) => r.sensor_id == "{sensor_id}")'
             )
-            tables = self.query_api.query(query, org=self.org)
-            newest = None
-            for table in tables:
-                for record in table.records:
-                    ts = record.get_time()
-                    if ts is not None and (newest is None or ts > newest):
-                        newest = ts
-            if newest is not None:
-                return newest
-        except Exception as e:
-            logger.warning("Failed to query last timestamp from InfluxDB 2: %s", e)
-        return None
+        # 0 = unbounded: start from the Unix epoch rather than a
+        # relative window, so a sensor stale for longer than the
+        # window is still found.
+        start = f'-{int(lookback_min)}m' if lookback_min else '1970-01-01T00:00:00Z'
+        # last() runs per series, which is index-cheap.  A sensor that
+        # was ever renamed has one series per name under the same
+        # sensor_id, so this returns several rows - take the newest.
+        # (Collapsing with group()+sort() in Flux instead would sort the
+        # entire history: ~26s across 18 sensors versus ~1s.)
+        query = (
+            f'from(bucket: "{self.bucket}")'
+            f' |> range(start: {start})'
+            f' |> filter(fn: (r) => r._measurement == "{measurement_name}"'
+            f'    and r._field == "temperature")'
+            f'{sensor_filter}'
+            f' |> last()'
+        )
+        tables = self.query_api.query(query, org=self.org)
+        newest = None
+        for table in tables:
+            for record in table.records:
+                ts = record.get_time()
+                if ts is not None and (newest is None or ts > newest):
+                    newest = ts
+        return newest
 
     def close(self):
         if self.client:
@@ -741,32 +742,66 @@ class InfluxDB3Writer(BaseWriter):
             return
         self.client.write(record=records)
 
+    # Windows (minutes) searched before an unbounded query - see
+    # get_last_timestamp().  The first two stay below InfluxDB 3 Core's
+    # default query file limit (432 files, about three days of 10-minute
+    # files); wider ones may exceed it on a long history.
+    SEARCH_WINDOWS_MIN = (24 * 60, 2 * 24 * 60, 30 * 24 * 60)
+
+    # "table 'public.iox.SensorPush' not found", "database not found: x",
+    # "Database 'x' not found" - but not e.g. "parquet file not found".
+    _MISSING_RE = re.compile(
+        r"\b(?:table|database|namespace)\s*"
+        r"(?:'[^']*'|\"[^\"]*\"|`[^`]*`|[\w.\-]+)?\s*not found\b",
+        re.IGNORECASE)
+
+    @classmethod
+    def _is_missing(cls, exc):
+        """True if InfluxDB 3 says the table or database does not exist yet.
+
+        That is a genuine "no data" (a fresh install before its first
+        write), not a failed lookup.
+        """
+        return bool(cls._MISSING_RE.search(str(exc)))
+
+    def _max_time(self, measurement_name, sensor_id, minutes):
+        conds = []
+        if minutes:
+            conds.append(f"time > now() - INTERVAL '{int(minutes)} minutes'")
+        if sensor_id is not None:
+            conds.append(f"sensor_id = '{sensor_id}'")
+        where = f" WHERE {' AND '.join(conds)}" if conds else ''
+        query = (
+            f'SELECT max(time) AS last_time FROM "{measurement_name}"'
+            f'{where}'
+        )
+        try:
+            result = self.client.query(query)
+        except Exception as e:
+            if self._is_missing(e):
+                return None
+            raise
+        if result is not None and len(result) > 0:
+            last_time = result.column('last_time')[0].as_py()
+            if last_time:
+                return last_time
+        return None
+
     def get_last_timestamp(self, measurement_name, sensor_id=None,
                            lookback_min=0):
-        try:
-            sensor_filter = ''
-            if sensor_id is not None:
-                sensor_filter = f" AND sensor_id = '{sensor_id}'"
-            # 0 = unbounded: omit the time predicate entirely.
-            if lookback_min:
-                where = (f" WHERE time > now() - INTERVAL '{int(lookback_min)} minutes'"
-                         f'{sensor_filter}')
-            elif sensor_id is not None:
-                where = f" WHERE sensor_id = '{sensor_id}'"
-            else:
-                where = ''
-            query = (
-                f'SELECT max(time) AS last_time FROM "{measurement_name}"'
-                f'{where}'
-            )
-            result = self.client.query(query)
-            if result and len(result) > 0:
-                last_time = result.column('last_time')[0].as_py()
-                if last_time:
-                    return last_time
-        except Exception as e:
-            logger.warning("Failed to query last timestamp from InfluxDB 3: %s", e)
-        return None
+        # Errors propagate on purpose - see BaseWriter.get_last_timestamp.
+        if lookback_min:
+            return self._max_time(measurement_name, sensor_id, lookback_min)
+        # Unbounded.  max(time) without a time predicate has to open every
+        # Parquet file of the table, and InfluxDB 3 Core refuses queries
+        # that would scan more files than its query file limit - which a
+        # long history exceeds.  An active sensor is found in the first,
+        # cheap window; only stale sensors need the wider ones.
+        for minutes in self.SEARCH_WINDOWS_MIN:
+            ts = self._max_time(measurement_name, sensor_id, minutes)
+            if ts is not None:
+                return ts
+        return self._max_time(measurement_name, sensor_id, 0)
 
     def close(self):
         if self.client:
@@ -831,42 +866,41 @@ class VMWriter(BaseWriter):
 
     def get_last_timestamp(self, measurement_name, sensor_id=None,
                            lookback_min=0):
-        try:
-            # tlast_over_time() (MetricsQL, VictoriaMetrics >= v1.52) returns
-            # the time of the newest raw sample as its *value*, value[1].
-            # The timestamp in value[0] is only the query's evaluation time
-            # - "now" - so reading it (as last_over_time() did here) made
-            # every stored series look current: an outage was never
-            # back-filled and a silent sensor was never noticed.
-            sensor_filter = ''
-            if sensor_id is not None:
-                sensor_filter = f'sensor_id="{sensor_id}"'
-            url = f'{self.url}/api/v1/query'
-            metric = f'{measurement_name}_temperature'
-            # MetricsQL has no unbounded lookbehind; 10y stands in for
-            # "no limit" and comfortably exceeds any real retention.
-            window = f'{int(lookback_min)}m' if lookback_min else '10y'
-            query_str = f'tlast_over_time({metric}{{{sensor_filter}}}[{window}])'
-            response = self.session.get(
-                url,
-                params={'query': query_str},
-                verify=self.verify_ssl,
-                timeout=30
-            )
-            response.raise_for_status()
-            data = response.json()
-            results = data.get('data', {}).get('result', [])
-            if results:
-                # One result per label set, so a renamed sensor yields
-                # several series under the same sensor_id - take the
-                # newest, not the first.
-                ts = max(float(r['value'][1]) for r in results)
-                return datetime.datetime.fromtimestamp(
-                    ts, tz=datetime.timezone.utc)
+        # Errors propagate on purpose - see BaseWriter.get_last_timestamp.
+        #
+        # tlast_over_time() (MetricsQL, VictoriaMetrics >= v1.52) returns
+        # the time of the newest raw sample as its *value*, value[1].  The
+        # timestamp in value[0] is only the query's evaluation time - "now"
+        # - so reading it (as an earlier last_over_time() version did) made
+        # every stored series look current: an outage was never back-filled
+        # and a silent sensor was never noticed.
+        sensor_filter = ''
+        if sensor_id is not None:
+            sensor_filter = f'sensor_id="{sensor_id}"'
+        url = f'{self.url}/api/v1/query'
+        metric = f'{measurement_name}_temperature'
+        # MetricsQL has no unbounded lookbehind; 10y stands in for
+        # "no limit" and comfortably exceeds any real retention.
+        window = f'{int(lookback_min)}m' if lookback_min else '10y'
+        query_str = f'tlast_over_time({metric}{{{sensor_filter}}}[{window}])'
+        response = self.session.get(
+            url,
+            params={'query': query_str},
+            verify=self.verify_ssl,
+            timeout=30
+        )
+        response.raise_for_status()
+        data = response.json()
+        if data.get('status') != 'success':
+            raise RuntimeError(
+                f"VictoriaMetrics query failed: {data.get('error') or data}")
+        results = data.get('data', {}).get('result', [])
+        if not results:
             return None
-        except Exception as e:
-            logger.warning("Failed to query last timestamp from VictoriaMetrics: %s", e)
-        return None
+        # One result per label set, so a renamed sensor yields several
+        # series under the same sensor_id - take the newest, not the first.
+        ts = max(float(r['value'][1]) for r in results)
+        return datetime.datetime.fromtimestamp(ts, tz=datetime.timezone.utc)
 
     def close(self):
         if self.session:
@@ -1235,6 +1269,11 @@ class SensorPushDaemon:
         # cycles; until they succeed the high-water mark must not advance
         # past them or the hole becomes invisible to gap detection.
         self._failed_windows = []
+        # End of the newest collection known to have landed completely
+        # (persisted copy of _fetch_high_water).  Only consulted when the
+        # backends cannot be asked for their newest point - see
+        # _known_collected_until().
+        self._collected_until = None
         self._state_path = self._resolve_state_path()
         self._load_state()
         self._setup_signals()
@@ -1271,20 +1310,54 @@ class SensorPushDaemon:
         return None
 
     def _load_state(self):
-        if not self._state_path or not self._state_path.is_file():
-            return
-        try:
-            with open(self._state_path) as f:
-                data = json.load(f)
-            self._sensor_state = data.get('sensors', {})
-            self._failed_windows = data.get('failed_windows', [])
-            if self._sensor_state or self._failed_windows:
-                logger.info("Restored state: %d sensor(s) pending back-fill, "
-                            "%d failed window(s) to retry",
-                            len(self._sensor_state), len(self._failed_windows))
-        except Exception as e:
-            logger.warning("Could not read state file %s: %s",
-                           self._state_path, e)
+        # Written by this release (which always stores the key, null until
+        # known)?  Only state from an older release may adopt its marker.
+        current_format = False
+        if self._state_path and self._state_path.is_file():
+            try:
+                with open(self._state_path) as f:
+                    data = json.load(f)
+                self._sensor_state = data.get('sensors', {})
+                self._failed_windows = data.get('failed_windows', [])
+                current_format = 'collected_until' in data
+                if data.get('collected_until'):
+                    try:
+                        ts = datetime.datetime.fromisoformat(
+                            data['collected_until'])
+                        if ts.tzinfo is None:
+                            ts = ts.replace(tzinfo=datetime.timezone.utc)
+                        self._collected_until = ts
+                    except (TypeError, ValueError):
+                        logger.warning("Ignoring unreadable collected_until "
+                                       "%r in %s", data['collected_until'],
+                                       self._state_path)
+                if self._sensor_state or self._failed_windows:
+                    logger.info("Restored state: %d sensor(s) pending "
+                                "back-fill, %d failed window(s) to retry",
+                                len(self._sensor_state),
+                                len(self._failed_windows))
+            except Exception as e:
+                logger.warning("Could not read state file %s: %s",
+                               self._state_path, e)
+        if not current_format:
+            self._adopt_last_success_marker()
+
+    def _adopt_last_success_marker(self):
+        """First start after upgrading: seed collected_until, once.
+
+        Older releases wrote last-success at the end of a cycle that had
+        stored data, so their marker is the best "collected up to" point
+        available.  The state file is rewritten in this release's format
+        right away - with the adopted value, or null - because from now on
+        last-success is refreshed after every window that lands, also
+        halfway through a long back-fill, and must never be adopted again.
+        """
+        marker = self._read_last_success_marker()
+        if marker is not None:
+            self._collected_until = marker
+            logger.info("Taking the last-success marker (%s) as the end of "
+                        "the last completed collection", marker.isoformat())
+        self._save_state()
 
     def _write_last_success(self):
         """Publish the last time data actually reached a backend.
@@ -1304,6 +1377,51 @@ class SensorPushDaemon:
         except Exception as e:
             logger.debug("Could not write last-success marker: %s", e)
 
+    def _mark_success(self):
+        """Note that data just reached a backend.
+
+        Called after every window that landed, not once per cycle: a long
+        back-fill can take hours, and data is flowing the whole time, so
+        the freshness check must not alert during it.
+        """
+        self._last_successful_time = datetime.datetime.now(
+            tz=datetime.timezone.utc)
+        self._write_last_success()
+
+    def _read_last_success_marker(self):
+        if not self._state_path:
+            return None
+        try:
+            text = (self._state_path.parent / 'last-success').read_text()
+            ts = datetime.datetime.fromisoformat(text.strip())
+        except FileNotFoundError:
+            return None
+        except Exception as e:
+            logger.debug("Could not read last-success marker: %s", e)
+            return None
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=datetime.timezone.utc)
+        return ts
+
+    def _known_collected_until(self):
+        """End of the newest collection known to have landed completely.
+
+        Only a fallback for when a backend cannot be asked for its newest
+        stored point.  Within this process that is the incremental
+        high-water mark; after a restart it is the copy persisted in
+        state.json (seeded once from an older release's last-success
+        marker, see _adopt_last_success_marker).  None if neither exists.
+
+        The mark covers the collector as a whole - it advances once a
+        cycle's windows reached at least one backend - so for a backend
+        that was rejecting writes while another one accepted them it can be
+        too recent.  That backend's own gap is found once it accepts writes
+        and answers lookups again.
+        """
+        if self._fetch_high_water is not None:
+            return self._fetch_high_water
+        return self._collected_until
+
     def _save_state(self):
         """Persist state atomically so a crash mid-write cannot corrupt it."""
         if not self._state_path:
@@ -1311,6 +1429,10 @@ class SensorPushDaemon:
         payload = {
             'sensors': self._sensor_state,
             'failed_windows': self._failed_windows,
+            # Always present (null until known): marks the file as written
+            # by a release that refreshes last-success per window.
+            'collected_until': (self._collected_until.isoformat()
+                                if self._collected_until is not None else None),
         }
         try:
             fd, tmp = tempfile.mkstemp(dir=str(self._state_path.parent),
@@ -1563,18 +1685,17 @@ class SensorPushDaemon:
                      datetime.date.strftime(stoptime, '%Y-%m-%dT%X%z'))
         logger.info("Iterations required: %d", iterations)
 
-        # Fetch and write samples
+        # Fetch and write samples.  The freshness marker is updated after
+        # every window that lands (see _mark_success).
         all_ok = True
-        wrote_any = False
+        state_dirty = False
         for i, window in enumerate(timelist, 1):
             if not self.running:
                 logger.info("Shutdown requested, stopping collection")
                 all_ok = False
                 break
-            if self._fetch_and_write_window(
+            if not self._fetch_and_write_window(
                     window, i, iterations, sensors, measurement_name):
-                wrote_any = True
-            else:
                 all_ok = False
                 self._record_failed_window(window)
         else:
@@ -1584,16 +1705,17 @@ class SensorPushDaemon:
             # which only ever looks at the newest stored point.
             if self.args.daemon and all_ok:
                 self._fetch_high_water = stoptime
-
-        if wrote_any:
-            self._last_successful_time = datetime.datetime.now(
-                tz=datetime.timezone.utc)
-            self._write_last_success()
+                if not self.args.dryrun:
+                    self._collected_until = stoptime
+                    state_dirty = True
 
         # Sensors lagging behind the rest are handled separately, and only
         # on deep-scan cycles to keep the probe traffic bounded.
         if self.args.daemon and deep_scan:
             self._handle_sensor_returns(sensors, measurement_name, currenttime)
+            state_dirty = True
+
+        if state_dirty:
             self._save_state()
 
     def _gap_lookback_min(self):
@@ -1675,18 +1797,24 @@ class SensorPushDaemon:
         #                    current the backend as a whole is
         per_sensor = {}
         per_writer = {}
+        # Backends whose newest point is unknown this scan: wname -> reason.
+        # 'unreadable' = asked, but every lookup failed; 'skipped' = not
+        # asked because it is disconnected or its last write failed.
+        unreadable = {}
+        skipped = {}
+        fallback = self._known_collected_until()
 
         for writer in self.writers:
             wname = type(writer).__name__
             if not writer.connected or writer._consecutive_failures > 0:
-                if not writer.connected:
-                    logger.debug("Skipping gap check on %s (not connected)",
-                                 wname)
-                else:
-                    logger.debug("Skipping gap check on %s "
-                                 "(%d consecutive write failures)",
-                                 wname, writer._consecutive_failures)
+                skipped[wname] = (
+                    'not connected' if not writer.connected else
+                    f'{writer._consecutive_failures} consecutive write failures')
+                logger.debug("Skipping gap check on %s (%s)", wname,
+                             skipped[wname])
                 continue
+            failed = 0
+            last_error = None
             for sid in sensor_ids:
                 if not self.running:
                     break
@@ -1698,7 +1826,9 @@ class SensorPushDaemon:
                         writer.measurement_name, sensor_id=sid_tag,
                         lookback_min=lookback_min)
                 except Exception as e:
-                    logger.warning(
+                    failed += 1
+                    last_error = e
+                    logger.debug(
                         "Could not query last timestamp for sensor %s "
                         "from %s: %s", sid, wname, e)
                     continue
@@ -1710,6 +1840,44 @@ class SensorPushDaemon:
                     per_sensor[sid] = ts
                 if wname not in per_writer or ts > per_writer[wname]:
                     per_writer[wname] = ts
+            if failed and wname not in per_writer:
+                unreadable[wname] = last_error
+            elif failed:
+                logger.warning(
+                    "Could not query the newest stored point of %d of %d "
+                    "sensor(s) on %s (last error: %s); they sit out this gap "
+                    "check", failed, len(sensor_ids), wname, last_error)
+                # If only stale sensors answered, their old points must not
+                # drag the window back over data known to be collected.
+                if fallback is not None and fallback > per_writer[wname]:
+                    per_writer[wname] = fallback
+
+        # A backend whose newest point is unknown must not count as empty:
+        # that would fetch only the poll backlog, and once the next write
+        # lands the outage before this start can never be found again.
+        # Assume instead that it holds everything up to the last collection
+        # known to have completed.
+        when = (fallback.astimezone(mytz).strftime('%Y-%m-%dT%X%z')
+                if fallback is not None else None)
+        for wname, err in unreadable.items():
+            if fallback is not None:
+                logger.warning(
+                    "Could not read the newest stored point from %s (%s); "
+                    "resuming from %s, the end of the last collection known "
+                    "to have completed", wname, err, when)
+                per_writer[wname] = fallback
+            else:
+                logger.warning(
+                    "Could not read the newest stored point from %s (%s), "
+                    "and no completed collection is on record; fetching only "
+                    "the poll backlog. If the daemon was down before this "
+                    "start, back-fill that time with a one-shot run (-s/-p).",
+                    wname, err)
+        for wname, reason in skipped.items():
+            if fallback is not None:
+                logger.info("Not asking %s for its newest point (%s); assuming "
+                            "it holds everything up to %s", wname, reason, when)
+                per_writer[wname] = fallback
 
         # Remember for _handle_sensor_returns(); local tz for logging.
         self._sensor_last_stored = {
@@ -1719,6 +1887,16 @@ class SensorPushDaemon:
         collector_ts = min(per_writer.values()) if per_writer else None
         self._collector_high_water = (collector_ts.astimezone(mytz)
                                       if collector_ts else None)
+        # That is also how far collection is known to be complete.  Persist
+        # it now, before a possibly long back-fill starts: if the process
+        # dies halfway and the next start cannot read the backends, this is
+        # where it must resume - not wherever the back-fill had got to.
+        # (Not after a shutdown interrupted the scan: then only some backends
+        # were asked.)
+        if (self.running and collector_ts is not None
+                and collector_ts != self._collected_until):
+            self._collected_until = collector_ts
+            self._save_state()
 
         if collector_ts:
             collector_local = collector_ts.astimezone(mytz)
@@ -2004,6 +2182,8 @@ class SensorPushDaemon:
                     written = True
                 else:
                     written = self._safe_write(records)
+                    if written:
+                        self._mark_success()
 
                 # Delay between iterations
                 if iterations > 1 and iteration < iterations:
