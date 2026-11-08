@@ -44,7 +44,7 @@ nano ~/.sensorpushd.conf
 ./sensorpushd.py --daemon --interval 300
 
 # Dry run to preview data without writing
-./sensorpushd.py -b 10m -x --backend victoriametrics
+./sensorpushd.py -b 1h -x --backend victoriametrics
 
 # List your sensors, including the sensor_id each one is stored under
 ./sensorpushd.py -l
@@ -107,7 +107,8 @@ SENSOR_UID = False
 
 [DAEMON]
 INTERVAL = 300
-POLL_BACKLOG = 10m
+# How far every poll reaches back; at least 1h (see "Daemon features")
+POLL_BACKLOG = 1h
 
 [MISC]
 MY_ALTITUDE = 0.0
@@ -186,8 +187,7 @@ What enabling it changes:
   Queries that keep every tag apart - InfluxQL `GROUP BY *`, Flux without `group()`,
   PromQL/MetricsQL without `sum by`/`avg by` - show the old and the new series side by side.
 - **A one-time overlap.** After the restart that enables it, the daemon re-reads the
-  last `POLL_BACKLOG` (10 minutes), or the hour before the newest stored point if it was
-  stopped for longer than that. Those points are then stored with and without
+  last `POLL_BACKLOG` (one hour), or more if it was stopped for longer than that. Those points are then stored with and without
   `sensor_uid`: `mean()` is unaffected, `count()` and `sum()` double for that stretch.
   The same happens whenever time from before the switch is fetched again, e.g. a one-shot
   run with `-s`/`-p`, or a back-fill for a second backend that had fallen behind.
@@ -220,6 +220,7 @@ sudo journalctl -u sensorpushd -f
 ### Daemon features
 
 - **Multi-backend**: Write to multiple databases simultaneously; each backend is independent — one failure does not block the others
+- **Complete polls**: Every poll reaches back at least an hour (`POLL_BACKLOG`, default `1h`). The SensorPush API hands out each sensor's samples in chunks of about 15 minutes and selects a chunk by its *start* time, so a query from T returns only chunks that started at or after T. A shorter window silently misses most samples; shorter settings are raised to 1h with a warning. If you ran an earlier version with a 10-minute backlog, see [CHANGELOG.md](CHANGELOG.md) for how to back-fill what it missed
 - **Gap-filling**: If the API or database was unavailable, the daemon automatically detects the gap on the next successful cycle and back-fills the missing data. It finds the gap by asking each backend for its newest stored point, so the token needs read access as well as write access. If a backend cannot be asked (a timeout, missing permission, or it is failing writes at that moment), the daemon resumes from the end of the last collection known to have completed (kept in `state.json`) instead of assuming an empty database. That mark is kept for the collector as a whole: a backend that rejected writes while another one kept working catches up once it accepts writes and answers lookups again. VictoriaMetrics needs v1.52 or later (`tlast_over_time()`)
 - **Graceful shutdown**: Responds to SIGTERM/SIGINT for clean shutdown
 - **Error recovery**: Retries with exponential backoff on API or backend failures; never exits on transient errors

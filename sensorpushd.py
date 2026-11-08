@@ -155,8 +155,20 @@ HTTP_OA_HEAD = {'accept': 'application/json',
 MEASURES = ["altitude", "barometric_pressure", "dewpoint", "humidity",
             "temperature", "vpd", "distance"]
 
+# The SensorPush API hands out each sensor's samples in chunks of roughly 15
+# minutes and selects a chunk by its *start* time: a query from T returns
+# only chunks that started at or after T, even when an earlier chunk holds
+# samples observed after T.  A poll that reaches back only a few minutes
+# therefore silently misses most samples - with 10 minutes, measured on a
+# real installation, about half to three quarters of them.  Every window
+# that looks back from "now" reaches back at least this far, so each chunk
+# is fetched again after it has been completed and uploaded.
+MIN_POLL_BACKLOG_MIN = 60
+
 # Defaults for the [DAEMON] section, shared by the unified and legacy loaders.
 #
+#   poll_backlog  How far every poll reaches back.  Never less than
+#       MIN_POLL_BACKLOG_MIN; shorter settings are raised (with a warning).
 #   max_consecutive_failures  0 = never give up.  The daemon backs off
 #       exponentially instead; a transient upstream outage must not end
 #       collection permanently.
@@ -172,7 +184,7 @@ MEASURES = ["altitude", "barometric_pressure", "dewpoint", "humidity",
 #       daemon should still be able to recover from.
 DEFAULT_DAEMON_CFG = {
     'interval': 300,
-    'poll_backlog': '10m',
+    'poll_backlog': '1h',
     'max_backfill': '0',
     'deep_scan_interval': '1h',
     'max_consecutive_failures': 0,
@@ -299,7 +311,7 @@ def _load_unified(config):
         'victoriametrics': None,
         'daemon': {
             'interval': config.getint('DAEMON', 'INTERVAL', fallback=300),
-            'poll_backlog': config.get('DAEMON', 'POLL_BACKLOG', fallback='10m'),
+            'poll_backlog': config.get('DAEMON', 'POLL_BACKLOG', fallback='1h'),
             'max_backfill': config.get('DAEMON', 'MAX_BACKFILL', fallback='0'),
             'deep_scan_interval': config.get('DAEMON', 'DEEP_SCAN_INTERVAL', fallback='1h'),
             'max_consecutive_failures': config.getint(
@@ -403,7 +415,10 @@ SENSOR_UID = False
 
 [DAEMON]
 INTERVAL = 300
-POLL_BACKLOG = 10m
+# How far every poll reaches back.  The SensorPush API selects samples in
+# ~15-minute chunks by their start time, so shorter windows silently miss
+# data; anything below 1h is raised to 1h.
+POLL_BACKLOG = 1h
 # 0 = back-fill without limit.  Raising this off 0 caps how far the
 # daemon can recover after a long outage - see GAP_LOOKBACK too.
 MAX_BACKFILL = 0
@@ -440,13 +455,16 @@ def parse_args():
                     'stores readings in InfluxDB 2, InfluxDB 3, and/or VictoriaMetrics')
     parser.add_argument(
         '-s', '--start', dest='starttime', default='', type=str,
-        help='Start query at time (e.g. "2019-07-25T00:10:41+0200")')
+        help='Start query at time (e.g. "2019-07-25T00:10:41+0200"). Start '
+             '~15 min before the first sample you need: the API selects '
+             'samples in chunks by their start time')
     parser.add_argument(
         '-p', '--stop', dest='stoptime', default='', type=str,
         help='Stop query at time (e.g. "2019-07-26T00:10:41+0200")')
     parser.add_argument(
         '-b', '--backlog', dest='backlog', default='1d', type=str,
-        help='Historical data to fetch (default 1d) - format: <number>[m|h|d|w|M|Y]')
+        help='Historical data to fetch (default 1d, at least 1h) - format: '
+             '<number>[m|h|d|w|M|Y]')
     parser.add_argument(
         '-t', '--timestep', dest='timestep', default=720, type=int,
         help='Time slice per query in minutes (default 720 = 12h)')
@@ -1364,6 +1382,7 @@ class SensorPushDaemon:
         self._sensor_uids = {}
         self._reported_collisions = set()
         self._logged_id_map = False
+        self._warned_backlog = False
         self._state_path = self._resolve_state_path()
         self._load_state()
         self._setup_signals()
@@ -1916,8 +1935,8 @@ class SensorPushDaemon:
           high-water mark of the last completed cycle.  This keeps online
           sensors current cheaply.
         """
-        poll_backlog_str = self.config['daemon']['poll_backlog']
-        poll_backlog_min = parse_backlog(poll_backlog_str)
+        poll_backlog_min = self._backlog_min(
+            self.config['daemon']['poll_backlog'], 'POLL_BACKLOG')
         max_backfill_str = self.config['daemon']['max_backfill']
         max_backfill_min = parse_backlog(max_backfill_str) if max_backfill_str != '0' else 0
         deep_scan_str = self.config['daemon'].get('deep_scan_interval', '1h')
@@ -2089,8 +2108,8 @@ class SensorPushDaemon:
                 starttime = currenttime - datetime.timedelta(
                     minutes=poll_backlog_min)
         else:
-            logger.info("No existing data found, using poll backlog of %s",
-                        poll_backlog_str)
+            logger.info("No existing data found, using poll backlog of %d min",
+                        poll_backlog_min)
             starttime = currenttime - datetime.timedelta(
                 minutes=poll_backlog_min)
 
@@ -2289,13 +2308,37 @@ class SensorPushDaemon:
                     pass
         self._save_state()
 
+    def _backlog_min(self, setting, name):
+        """A look-back-from-now window in minutes, at least MIN_POLL_BACKLOG_MIN.
+
+        Shorter windows silently miss samples (see MIN_POLL_BACKLOG_MIN), so
+        they are raised, with one warning per process.
+        """
+        minutes = parse_backlog(setting)
+        if minutes >= MIN_POLL_BACKLOG_MIN:
+            return minutes
+        if not self._warned_backlog:
+            self._warned_backlog = True
+            logger.warning(
+                "%s = %s is raised to %d min: the SensorPush API returns "
+                "samples in ~15-minute chunks selected by their start time, "
+                "so a shorter window silently misses most of them. Set it to "
+                "1h (or more) to silence this warning.", name, setting,
+                MIN_POLL_BACKLOG_MIN)
+        return MIN_POLL_BACKLOG_MIN
+
     def _compute_oneshot_window(self, mytz, currenttime):
-        """Compute time window for one-shot mode (backward compatible)."""
+        """Compute time window for one-shot mode (backward compatible).
+
+        An explicit -s start is used as given; note that samples in the
+        first ~15 minutes after it can sit in a chunk that started earlier
+        (see MIN_POLL_BACKLOG_MIN), so start a little early to be safe.
+        """
         if self.args.starttime:
             starttime = datetime.datetime.strptime(
                 self.args.starttime, '%Y-%m-%dT%X%z')
         else:
-            backlog = parse_backlog(self.args.backlog)
+            backlog = self._backlog_min(self.args.backlog, '-b/--backlog')
             starttime = currenttime - datetime.timedelta(minutes=backlog)
 
         if self.args.stoptime:

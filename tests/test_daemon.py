@@ -1,6 +1,7 @@
 """Daemon behaviour: gap window, failed lookups, dry-run, SENSOR_UID."""
 import datetime
 import json
+import time
 import unittest
 
 from helpers import (DaemonTestCase, FakeAPI, ID_A, ID_B, ID_C, UTC,
@@ -10,6 +11,7 @@ spd = sensorpushd()
 TAG_A, TAG_B = spd.sensor_id_tag(ID_A), spd.sensor_id_tag(ID_B)
 NOW = datetime.datetime(2026, 11, 8, 12, 0, tzinfo=UTC)
 H = datetime.timedelta(hours=1)
+BACKLOG = datetime.timedelta(minutes=spd.MIN_POLL_BACKLOG_MIN)   # every poll reaches back at least this far
 
 
 class GapWindow(DaemonTestCase):
@@ -26,7 +28,7 @@ class GapWindow(DaemonTestCase):
 
     def test_empty_database_fetches_the_poll_backlog(self):
         d = self.make_daemon([fake_writer()])
-        self.assertEqual(self.window(d), NOW - datetime.timedelta(minutes=10))
+        self.assertEqual(self.window(d), NOW - BACKLOG)
 
     def test_failed_lookups_resume_from_the_persisted_collection_mark(self):
         (self.state_dir / 'state.json').write_text(json.dumps(
@@ -109,7 +111,7 @@ class GapWindow(DaemonTestCase):
         d = self.make_daemon([ok, down])
         d._fetch_high_water = NOW - datetime.timedelta(minutes=5)
         d._last_deep_scan = None
-        self.assertEqual(self.window(d), NOW - datetime.timedelta(minutes=10))
+        self.assertEqual(self.window(d), NOW - BACKLOG)
 
     def test_only_a_stale_sensor_answering_cannot_drag_the_window_back(self):
         w = fake_writer(newest={TAG_B: NOW - 90 * 24 * H}, fail={TAG_A})
@@ -121,7 +123,7 @@ class GapWindow(DaemonTestCase):
     def test_failed_lookups_with_nothing_on_record_warn_loudly(self):
         d = self.make_daemon([fake_writer(fail=True)])
         with self.assertLogs('sensorpushd', 'WARNING') as logs:
-            self.assertEqual(self.window(d), NOW - datetime.timedelta(minutes=10))
+            self.assertEqual(self.window(d), NOW - BACKLOG)
         self.assertIn('no completed collection is on record', '\n'.join(logs.output))
 
     def test_in_process_high_water_mark_wins(self):
@@ -160,6 +162,86 @@ class GapWindow(DaemonTestCase):
         self.window(self.make_daemon([w]), ids=(ID_A, ID_C))
         self.assertEqual([sid for _, sid in w.lookups],
                          [str(float(ID_A)), str(float(ID_C))])
+
+
+class PollBacklog(DaemonTestCase):
+    """Every look-back window reaches back at least MIN_POLL_BACKLOG_MIN.
+
+    The SensorPush API returns each sensor's samples in ~15-minute chunks
+    and selects a chunk by its start time, so a short window misses data.
+    """
+
+    def test_short_setting_is_raised_with_one_warning(self):
+        d = self.make_daemon([fake_writer()], poll_backlog='10m')
+        with self.assertLogs('sensorpushd', 'WARNING') as logs:
+            start, _, _ = d._compute_daemon_window(UTC, NOW, sensors(ID_A))
+        self.assertEqual(start, NOW - BACKLOG)
+        self.assertIn('POLL_BACKLOG = 10m is raised to 60 min', '\n'.join(logs.output))
+        d._last_deep_scan = None
+        with self.assertNoLogs('sensorpushd', 'WARNING'):
+            d._compute_daemon_window(UTC, NOW, sensors(ID_A))
+
+    def test_default_and_longer_settings_are_kept(self):
+        self.assertEqual(spd.DEFAULT_DAEMON_CFG['poll_backlog'], '1h')
+        d = self.make_daemon([fake_writer()], poll_backlog='2h')
+        start, _, _ = d._compute_daemon_window(UTC, NOW, sensors(ID_A))
+        self.assertEqual(start, NOW - 2 * H)
+
+    def test_incremental_poll_reaches_back_an_hour(self):
+        d = self.make_daemon([fake_writer()], poll_backlog='10m')
+        d._fetch_high_water = NOW - datetime.timedelta(minutes=5)
+        d._last_deep_scan = time.monotonic()
+        with self.assertLogs('sensorpushd', 'WARNING'):
+            start, _, deep = d._compute_daemon_window(UTC, NOW, sensors(ID_A))
+        self.assertFalse(deep)
+        self.assertEqual(start, NOW - BACKLOG)
+
+    def test_oneshot_backlog_is_raised(self):
+        d = self.make_daemon([fake_writer()], args=make_args(daemon=False, backlog='10m'))
+        with self.assertLogs('sensorpushd', 'WARNING'):
+            start, _ = d._compute_oneshot_window(UTC, NOW)
+        self.assertEqual(start, NOW - BACKLOG)
+
+    def simulate(self, hours=4, chunk=900, delay=120):
+        """Poll every 5 min against an API that answers in chunks.
+
+        One sample a minute per sensor; each sensor's chunks start at its
+        own phase; a sample is visible ``delay`` s after it was observed; a
+        query from T returns only chunks that started at or after T.
+        Returns the number of settled samples that never got stored.
+        """
+        t0 = int(NOW.timestamp()) - hours * 3600
+        phases = {ID_A: 0, ID_B: 300, ID_C: 610}
+        cloud = {(sid, t0 + k * 60 + p % 60) for sid, p in phases.items()
+                 for k in range(hours * 60)}
+        chunk_start = lambda sid, t: t - (t - phases[sid]) % chunk
+        w = fake_writer()
+        d = self.make_daemon([w], poll_backlog='10m')
+        stored = set()
+        for now in range(t0 + 3600, int(NOW.timestamp()) + 1, 300):
+            at = datetime.datetime.fromtimestamp(now, UTC)
+            w.newest = {spd.sensor_id_tag(sid): datetime.datetime.fromtimestamp(t, UTC)
+                        for sid, t in stored}
+            start, _, _ = d._compute_daemon_window(UTC, at, sensors(*phases))
+            stored |= {(sid, t) for sid, t in cloud
+                       if t + delay <= now and chunk_start(sid, t) >= start.timestamp()}
+            d._fetch_high_water = at
+        settled = {(sid, t) for sid, t in cloud
+                   if t0 + 3600 <= t <= NOW.timestamp() - 1800}
+        return len(settled - stored)
+
+    def test_no_sample_is_lost_with_chunked_answers(self):
+        with self.assertLogs('sensorpushd', 'WARNING'):
+            self.assertEqual(self.simulate(), 0)
+
+    def test_simulation_catches_the_old_ten_minute_window(self):
+        floor = spd.MIN_POLL_BACKLOG_MIN
+        spd.MIN_POLL_BACKLOG_MIN = 0          # behave like before the fix
+        try:
+            missing = self.simulate()
+        finally:
+            spd.MIN_POLL_BACKLOG_MIN = floor
+        self.assertGreater(missing, 100)
 
 
 class Persistence(DaemonTestCase):

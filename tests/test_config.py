@@ -47,6 +47,8 @@ class Template(unittest.TestCase):
                     for k, v in OLD_DEFAULTS.items()}
         for backend in ('influxdb2', 'influxdb3', 'victoriametrics'):
             expected[backend]['sensor_uid'] = False
+        # The one intended change: 10m polls silently lost most samples.
+        expected['daemon']['poll_backlog'] = '1h'
         self.assertEqual(cfg, expected)
         self.assertEqual(cfg['daemon'], dict(spd.DEFAULT_DAEMON_CFG))
 
