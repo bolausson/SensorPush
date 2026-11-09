@@ -201,6 +201,45 @@ What enabling it changes:
 Turning it off again splits the series once more, the same way. `migrate_influx2vm.py`
 copies `sensor_uid` as a label.
 
+### Live and final samples
+
+For the newest minutes the SensorPush API serves most readings twice: first as a live
+copy at an irregular second, and later as the sensor's own sample, on a fixed second of
+the minute and usually within a minute of the copy (before or after it, depending on the
+sensor). After about half an hour the API normally serves only the sensor's own samples,
+so a later re-read or back-fill returns only those.
+
+The daemon stores every sample the API serves. With the default settings a sensor
+therefore has about twice as many points as a re-read returns. Data written by versions
+with a 10-minute backlog contains live copies too, and so can data from the old scripts;
+a back-fill does not remove them. This is on purpose: the live copies are the only data
+for the newest minutes, and some readings are never served in any other form. No stored
+field marks a live copy; the best hint is the timestamp, because a sensor's own samples
+sit on one second of the minute (which can shift after a gap) and live copies almost
+never do.
+
+What this means for queries:
+
+- Averages, minimum and maximum are practically unaffected, the newest value is more
+  current, and the shipped dashboards need no change.
+- `count()` counts both copies. To check completeness, count the minutes that have data
+  rather than the points.
+- `derivative()`, `difference()` and similar functions on raw points spike, because a live
+  copy and the neighbouring sample can be seconds apart and one reading step different.
+  Aggregate first.
+
+```sql
+-- InfluxQL: minutes with data, per sensor
+SELECT count("c") FROM (
+  SELECT count("temperature") AS "c" FROM "SensorPush"
+  WHERE $timeFilter GROUP BY time(1m), "sensor_name" fill(none)
+) WHERE $timeFilter GROUP BY "sensor_name"
+
+-- InfluxQL: rate of change of 5-minute means
+SELECT derivative(mean("temperature"), 1m) FROM "SensorPush"
+  WHERE $timeFilter GROUP BY time(5m), "sensor_name"
+```
+
 ### Running as a systemd service
 
 ```bash
@@ -220,7 +259,7 @@ sudo journalctl -u sensorpushd -f
 ### Daemon features
 
 - **Multi-backend**: Write to multiple databases simultaneously; each backend is independent — one failure does not block the others
-- **Complete polls**: Every poll reaches back at least an hour (`POLL_BACKLOG`, default `1h`). The SensorPush API hands out each sensor's samples in chunks of about 15 minutes and selects a chunk by its *start* time, so a query from T returns only chunks that started at or after T. A shorter window silently misses most samples; shorter settings are raised to 1h with a warning. If you ran an earlier version with a 10-minute backlog, see [CHANGELOG.md](CHANGELOG.md) for how to back-fill what it missed
+- **Complete polls**: Every poll reaches back at least an hour (`POLL_BACKLOG`, default `1h`). The SensorPush API hands out each sensor's samples in chunks of about 15 minutes and selects a chunk by its *start* time, so a query from T returns only chunks that started at or after T. A shorter window silently misses most samples; shorter settings are raised to 1h with a warning. If you ran an earlier version with a 10-minute backlog, see [CHANGELOG.md](CHANGELOG.md) for how to back-fill what it missed. The newest minutes also come as live copies, which are stored too; see [Live and final samples](#live-and-final-samples)
 - **Gap-filling**: If the API or database was unavailable, the daemon automatically detects the gap on the next successful cycle and back-fills the missing data. It finds the gap by asking each backend for its newest stored point, so the token needs read access as well as write access. If a backend cannot be asked (a timeout, missing permission, or it is failing writes at that moment), the daemon resumes from the end of the last collection known to have completed (kept in `state.json`) instead of assuming an empty database. That mark is kept for the collector as a whole: a backend that rejected writes while another one kept working catches up once it accepts writes and answers lookups again. VictoriaMetrics needs v1.52 or later (`tlast_over_time()`)
 - **Graceful shutdown**: Responds to SIGTERM/SIGINT for clean shutdown
 - **Error recovery**: Retries with exponential backoff on API or backend failures; never exits on transient errors

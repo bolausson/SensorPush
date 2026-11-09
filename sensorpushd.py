@@ -160,9 +160,16 @@ MEASURES = ["altitude", "barometric_pressure", "dewpoint", "humidity",
 # only chunks that started at or after T, even when an earlier chunk holds
 # samples observed after T.  A poll that reaches back only a few minutes
 # therefore silently misses most samples - with 10 minutes, measured on a
-# real installation, about half to three quarters of them.  Every window
+# real installation, about three quarters of them.  Every window
 # that looks back from "now" reaches back at least this far, so each chunk
 # is fetched again after it has been completed and uploaded.
+#
+# For the newest minutes (up to about half an hour) the API also serves live
+# copies of the readings at irregular seconds; a later re-read returns only
+# the sensor's own samples, on a fixed second of the minute and usually
+# within a minute of the copies.  Both are stored on purpose: the live copies
+# are the only data for the newest minutes, and some readings are never
+# served in any other form.  See the README section "Live and final samples".
 MIN_POLL_BACKLOG_MIN = 60
 
 # Defaults for the [DAEMON] section, shared by the unified and legacy loaders.

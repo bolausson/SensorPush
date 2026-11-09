@@ -8,6 +8,9 @@
   InfluxDB 3 and VictoriaMetrics (see [issue #9](https://github.com/bolausson/SensorPush/issues/9)
   and the README section "Stored sensor ids"). Without a new config key, nothing that is
   written changes.
+- Every sample the API serves is stored, as before, including the live copies it serves
+  for the newest minutes (see [issue #9](https://github.com/bolausson/SensorPush/issues/9)
+  and the README section "Live and final samples").
 
 ### Fixed
 
@@ -15,11 +18,13 @@
   in chunks of about 15 minutes and selects a chunk by its *start* time: a query from T
   returns only chunks that started at or after T, even when an earlier chunk holds samples
   observed after T. The daemon's polls reached back only `POLL_BACKLOG` (default 10
-  minutes), so most chunks were never fetched - on one installation 45-73 % of all samples
-  have been missing since the daemon replaced the cron scripts - and nothing noticed,
-  because the collector as a whole always looked current. `POLL_BACKLOG` now defaults to
-  `1h`, and shorter settings (including the `10m` that generated configs spell out) are
-  raised to 1h with a warning. The same floor applies to one-shot `-b`.
+  minutes), so most chunks were never fetched - on one installation about three quarters
+  of all samples have been missing since the daemon replaced the cron scripts - and
+  nothing noticed, because the collector as a whole always looked current. (Comparing
+  point counts with the API shows less, because the database also holds live copies; see
+  the README section "Live and final samples".) `POLL_BACKLOG` now defaults to `1h`, and
+  shorter settings (including the `10m` that generated configs spell out) are raised to
+  1h with a warning. The same floor applies to one-shot `-b`.
 - **VictoriaMetrics gap detection never found a gap.** The newest stored point was read
   from the timestamp of an instant `last_over_time()` query, which is the query's
   evaluation time ("now"). Every series therefore looked current: after a daemon outage
@@ -77,13 +82,19 @@
 - **Recover the samples short polls missed.** The SensorPush cloud still has them (at
   least several months back). Back-fill from when you started the daemon with a one-shot
   run, e.g. `./sensorpushd.py -c /etc/sensorpushd.conf -s 2026-07-01T00:00:00+0200 -d 10`.
-  It writes the same tags, so no new series appear, and points already stored are
-  overwritten with identical values. One caveat: it stores every sample under the sensor's
+  It writes the same tags, so no new series appear. Samples already stored are overwritten
+  with identical values and missing ones are added as new points; live copies stored
+  earlier stay (README section "Live and final samples"), so a back-filled day holds more
+  points than a re-read of it returns. One caveat: it stores every sample under the sensor's
   *current* name, so a sensor renamed within that period would get its earlier samples a
   second time, under the new name. Leave such a sensor out of the main run (list the
   others with `-i`) and back-fill it on its own from the rename onwards.
 - **Bigger polls:** every poll now fetches about an hour of samples (about 60 per sensor
-  instead of about 10). Writing points that are already stored again does no harm.
+  instead of about 10). On InfluxDB 2 and 3, writing a point that is already stored
+  replaces it with identical values, so this does no harm. The polls also catch the live
+  copy of most readings, so with the default settings the database gets about twice as
+  many points as a re-read returns; queries that count points or take derivatives of raw
+  points need adjusting (README section "Live and final samples").
 - **VictoriaMetrics:** the first gap check after upgrading sees VictoriaMetrics' real
   newest point for the first time. If it had fallen behind - for example because it was
   unreachable while another backend kept working - the daemon back-fills that time once,
