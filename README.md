@@ -214,16 +214,25 @@ therefore has about twice as many points as a re-read returns. Data written by v
 with a 10-minute backlog contains live copies too, and so can data from the old scripts;
 a back-fill does not remove them. This is on purpose: the live copies are the only data
 for the newest minutes, and some readings are never served in any other form. No stored
-field marks a live copy; the best hint is the timestamp, because a sensor's own samples
-sit on one second of the minute (which can shift after a gap) and live copies almost
-never do.
+field marks a live copy. In the API's answer an HT1's live copy names the gateway that
+relayed it, while its own sample leaves `gateways` empty, but the daemon does not store
+that field, and on HT.w and HTP.xw both carry it. In the database the best hint is the
+timestamp: a sensor's own samples sit on one second of the minute (which can shift after
+a gap), and live copies almost never do.
 
 What this means for queries:
 
 - Averages, minimum and maximum are practically unaffected, the newest value is more
   current, and the shipped dashboards need no change.
 - `count()` counts both copies. To check completeness, count the minutes that have data
-  rather than the points.
+  rather than the points, and compare a sensor with itself, not with other models. HT.w
+  and HTP.xw sensors have data in every minute. HT1 sensors seem to leave a reading out of
+  their own record when neither temperature nor humidity has changed: polled live, most
+  of mine have data in 40 to 55 minutes of an hour (the live copies fill part of the
+  holes), and a re-read or back-fill returns fewer. On an HT1 a missing minute is not a
+  lost reading, but a long silence points to missing data: in more than three months of
+  complete record, no working HT1 of mine was silent for more than about an hour, and no
+  HT.w or HTP.xw for more than about a minute.
 - `derivative()`, `difference()` and similar functions on raw points spike, because a live
   copy and the neighbouring sample can be seconds apart and one reading step different.
   Aggregate first.
@@ -238,6 +247,12 @@ SELECT count("c") FROM (
 -- InfluxQL: rate of change of 5-minute means
 SELECT derivative(mean("temperature"), 1m) FROM "SensorPush"
   WHERE $timeFilter GROUP BY time(5m), "sensor_name"
+
+-- InfluxQL: silences longer than an hour, per sensor (one still going on is not listed)
+SELECT "gap" FROM (
+  SELECT elapsed("temperature", 1m) AS "gap" FROM "SensorPush"
+  WHERE $timeFilter GROUP BY "sensor_name"
+) WHERE "gap" > 60 GROUP BY "sensor_name"
 ```
 
 ### Running as a systemd service
