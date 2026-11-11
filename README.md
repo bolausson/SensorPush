@@ -109,6 +109,10 @@ SENSOR_UID = False
 INTERVAL = 300
 # How far every poll reaches back; at least 1h (see "Daemon features")
 POLL_BACKLOG = 1h
+# When to re-read a gap after it closed; 0 = off (see "Gap re-checks")
+RECHECK_GAPS = 1h, 6h, 1d, 3d, 7d
+# The shortest silence of a sensor that counts as a gap
+RECHECK_MIN_GAP = 20m
 
 [MISC]
 MY_ALTITUDE = 0.0
@@ -255,6 +259,171 @@ SELECT "gap" FROM (
 ) WHERE "gap" > 60 GROUP BY "sensor_name"
 ```
 
+### Gap re-checks
+
+After an outage the cloud fills in the past late. When a gateway, the internet or the
+power comes back, the gateway uploads what its sensors recorded meanwhile: a small
+backlog usually within about an hour, the history of an HT1 sensor sometimes hours or
+weeks later. One read right after the outage finds only part of it.
+
+So the daemon notes every gap it sees in a sensor's data, a silence of more than
+`RECHECK_MIN_GAP` (default 20 minutes, at least 15), and reads it again, with an hour on
+either side, 1 hour, 6 hours, 1 day, 3 days and 7 days after the sensor reported again
+(`RECHECK_GAPS`). It writes whatever the cloud holds by then: the same points the polls
+write, with the same tags, fields and timestamps.
+
+It also notes what a poll did not reach. A poll looks back an hour, and the API leaves
+out up to 15 minutes after the start of a window in the newest hour (see "Complete
+polls"). A sensor's samples right after the last one the daemon saw can lie in that
+stretch, even when no gap shows: after the sensor was silent for about 45 minutes or
+more, after the daemon paused that long, and with polls more than 30 minutes apart. The
+daemon reads such a stretch once more at the first re-read time, an hour later, and
+writes what it holds. Only if that read shows a gap, or could not read all of it, is the
+stretch read on like a gap.
+
+What it costs:
+
+- No API calls while no sensor has a gap and `INTERVAL` is 30 minutes or less, or 60
+  minutes or more with the default `DEEP_SCAN_INTERVAL` of 1h.
+- With polls more than 30 and less than 60 minutes apart, the stretches a poll did not
+  reach cost calls also without any gap. Measured on 18 sensors (12 HT1, 2 HTP.xw, 4
+  HT.w) with the default `DEEP_SCAN_INTERVAL`: 4 to 13 calls a day at an `INTERVAL` of 35
+  minutes and 26 to 35 at 40 (more when HT1 live copies are further apart), 16 at 45, 14
+  at 50, 13 at 55 and 12 at 59. Below 45 minutes they find nothing on a normal day. From
+  45 minutes on they fetch what the API left out after each poll's start: at 59 minutes
+  about 1,100 samples a day on those 18 sensors, which are lost without them. With an
+  `INTERVAL` of 60 minutes or more and a longer `DEEP_SCAN_INTERVAL` it is up to one call
+  per poll (20 a day at 60 minutes with 6h).
+- A pause of the daemon of 40 to 60 minutes costs one call at most.
+- One call per re-read of a gap up to about 9 hours long (with the default `-t 720`), one
+  more per further 11 hours. A call serves every gap that fits in its window, so after an
+  outage of the whole installation one call covers all sensors, also when they come back
+  minutes apart.
+- At most 6 re-read calls and about 2 minutes per cycle (2 calls with the default
+  `--delay 60`). Long gaps are read over several cycles while the polls go on.
+- An HTP.xw or HT.w gap that a re-read finds complete (a sample every minute) is not
+  read again, and a gap longer than a day whose first re-read found nothing is next read
+  after 3 days (if `RECHECK_GAPS` has a read that late).
+- After a failed re-read call, re-reads pause for one polling interval, longer after each
+  further failure in a row, up to an hour; any call that works starts that over. They
+  also wait while the polls fail, and while any backend fails its writes (checked before
+  each call), so that every backend gets what they write.
+- A window that fails twice in a row is then read alone: one sensor per call, so that
+  one sensor's data cannot fail the others' call. The first of these reads decides for
+  the others: if it works, they are read together again (once per window and re-read);
+  if it fails, they are read alone. Apart from that first read, reads alone come after
+  the gaps read together and hold up none of them. Reads alone pause on their own after
+  a failure, with the same pauses: however many windows keep failing, they make at most
+  one failed call per pause, about 27 a day at an `INTERVAL` of 5 minutes. A window that
+  fails 3 times in a row is left for the gap's next re-read; the gap's next window is then
+  read alone and left after one failed call.
+- The last re-read has no next one. There a window that fails 3 times is kept and tried
+  again, alone. It is given up only when a call more than a day after the last re-read
+  time fails, so after that day it costs one call at most; each later window of the gap
+  is then given up after one failed call. A re-read whose later times all went by while
+  re-reads could not run is the last one too. A re-read that had begun before them and
+  was cut short (the Pi off, a backend failing) is not: the last re-read still follows,
+  and reads the whole gap again.
+- Of the reads alone after the gaps read together, windows read for the last time get
+  every other one while other windows wait too: windows kept on a gap's last re-read
+  (see the previous point), and the other windows of a gap's last re-read that failed
+  twice and are read alone. The tries of that day go by while they wait. A window whose
+  last write a backend refused does not take that turn: the backend will most likely
+  refuse it again (its points are older than a bucket's retention, say), and those tries
+  would halve the speed of the other windows. It waits with them and still gets its
+  calls; a later call that fails before the write (at the API, say) gives it the turn
+  back.
+- The other windows read alone go one gap at a time. In each of the two groups, windows
+  not read alone yet go first, the most overdue first, then the gap that began first;
+  then the one read alone least recently. A kept window whose last write a backend
+  refused, more than a day after the last re-read time, counts as not read alone yet if
+  its gap has a next window: its next failed call gives it up, and its gap goes on from
+  there. A gap's next window after one that was left has not been read alone yet, so
+  gaps whose windows all fail, such as gaps that reach beyond a bucket's retention (see
+  "Limits"), are crawled through one after another: one window per pause of the reads
+  alone (up to an hour), one per two pauses while a window that takes every other read
+  is due. The windows that wait get their calls later. That costs nothing while the
+  cloud and the bucket still hold their history, except for a window read for the last
+  time whose last write a backend refused: it waits too, and the tries of its last day
+  go by; after that day, one failed call gives it up. With a bucket retention, history
+  can age out meanwhile (see "Limits").
+- An answer cut off by `-q`/`--qlimit` is read again in smaller windows; one cut off even
+  in 30-minute windows counts as a failed call.
+
+The gaps are kept in `state.json` (key `rechecks`, ignored by older releases), so a
+restart does not lose them; re-reads that fell due meanwhile are done once, together. A
+sensor keeps at most 40 gaps, all sensors together 1,000; beyond that the closest gaps
+are merged into one, so none is dropped.
+
+`RECHECK_GAPS = 0` (or `off`, `no`, `none`, `false`, empty) turns the re-checks off: the
+daemon then behaves exactly as without them, and `state.json` gets no new key. Legacy
+config files (`~/.sensorpush.conf`, `~/.sensorpush_vm.conf`) may have a `[DAEMON]`
+section for this; `RECHECK_GAPS` and `RECHECK_MIN_GAP` are the only keys read from it. An
+invalid value stops the daemon at startup with a one-line error. One-shot runs ignore
+both keys.
+
+Limits:
+
+- **Horizon.** Samples that reach the cloud more than 7 days after the gap closed are not
+  fetched; a one-shot run with `-s`/`-p` still gets them.
+- **On-board storage.** Sensors keep about 20 days (HT1), 30 days (HTP.xw) or 45 days
+  (HT.w) of samples; older parts of a longer gap are not re-read.
+- **Bucket retention.** InfluxDB 2 refuses a write that holds any point older than the
+  bucket's retention (HTTP 422), so every re-read of a window that reaches beyond it
+  fails. The re-reads get through such windows one failed call each. Each moves a gap on
+  by one window, `-t` minus 60 minutes of data (11 hours at the default `-t 720`), while
+  the retention boundary moves an hour per hour. History that ages out of the bucket
+  meanwhile is lost, also that of the gaps that wait behind such a crawl. Measured on 18
+  sensors (12 HT1, 2 HTP.xw, 4 HT.w), of the samples the bucket would still take when
+  they came back: at `-t 720`, 91 % written after a 15-day outage with a 14-day bucket,
+  42 % after a 10-day outage with a 7-day bucket; after the 15-day outage 48 % at `-t
+  360`, 14 % at `-t 180`, and nothing at `-t 120` or less, where the re-reads never
+  catch up. After a 21-day outage with a 14-day bucket, the 6 HT.w and HTP.xw gaps waited
+  behind the 12 HT1 crawls, and only 150 of the 120,750 of their samples the bucket
+  would take were written. A bucket that keeps longer than the longest outage plus 7
+  days and an hour avoids all of this.
+- **Short buckets.** A re-read writes only when it finds more samples than the reads
+  before it, and it writes from an hour before the gap. With a bucket that keeps less than
+  the last re-read time plus the gap and an hour (with the default `RECHECK_GAPS`, any
+  bucket of 7 days or less), a last re-read that finds new samples - history uploaded
+  after the 3d read, say - is refused: its write holds points older than the bucket keeps.
+  Such a gap of 2 hours costs 29 failed calls over its last re-read and the day after it,
+  at an `INTERVAL` of 5 minutes, each with one INFO, one WARNING and three ERROR lines,
+  and is then given up. A gap whose history came by the 3d read costs nothing more: its
+  last re-read finds nothing new and writes nothing. Set `RECHECK_GAPS` to times inside
+  the retention, e.g. `1h, 6h, 1d, 3d` for a 7-day bucket.
+- **A write refused for a moment.** A window read for the last time whose write a backend
+  refused only for a moment (during a restart, say) loses its turn while other windows
+  are read alone, such as those of a gap crawling through windows a bucket refuses: it
+  waits with them, and the tries of its last day go by. It is lost if its single call
+  after that day fails, or if, with a bucket retention, its history ages out while other
+  gaps' windows go first. Measured: while the gap of a 30-day outage was crawled through
+  with a 14-day bucket, a 2-hour gap whose last re-read a backend refused for 2 hours got
+  its next call only 40 hours after its last re-read time.
+- **Re-read calls failing for more than a day.** A gap's last re-read gives up a window
+  that still fails more than a day after the last re-read time (see above). So when
+  SensorPush answers the polls but fails the re-read calls for more than a day, a gap
+  whose last re-read time came more than a day before that spell ends can lose the history
+  only that re-read would write; which of these gaps lose depends on when their calls
+  come. While the polls fail too, re-reads make no calls and give up nothing. Measured: 12
+  HT1 gaps at their last re-read during a 27-hour spell of failing re-read calls, 86 to
+  97 % of that history written.
+- **HT1 data not seen live.** HT1 sensors seem to leave a reading out of their own record
+  when neither temperature nor humidity has changed, so their own samples can be an hour
+  apart. While the daemon polls at most 25 minutes apart it also sees the live copies, at
+  most about 13 minutes apart, and a 20-minute silence is a real gap. In data it did not
+  see live - from its own downtime, across a restart, or with polls more than 25 minutes
+  apart - an HT1 gap counts only from 90 minutes, also in a stretch a poll did not reach.
+  So an HT1 silence of 20 to 90 minutes while the daemon was down too (a power cut that
+  took the Pi and the gateways down together) is not re-read. HTP.xw and HT.w sensors
+  record every minute and always use `RECHECK_MIN_GAP`.
+- **VictoriaMetrics duplicates.** Re-reads write some points again; with polls 45 to 59
+  minutes apart, the reads of what a poll did not reach write about 80 % more points
+  than the polls alone (measured on 18 sensors). InfluxDB overwrites them with identical
+  values; VictoriaMetrics without `-dedup.minScrapeInterval` keeps them as duplicates, as
+  it already does for the hour each poll overlaps the previous one. Averages, minimum and
+  maximum are unaffected; `count()` is not.
+
 ### Running as a systemd service
 
 ```bash
@@ -276,6 +445,7 @@ sudo journalctl -u sensorpushd -f
 - **Multi-backend**: Write to multiple databases simultaneously; each backend is independent — one failure does not block the others
 - **Complete polls**: Every poll reaches back at least an hour (`POLL_BACKLOG`, default `1h`). The SensorPush API hands out each sensor's samples in chunks of about 15 minutes and selects a chunk by its *start* time, so a query from T returns only chunks that started at or after T. A shorter window silently misses most samples; shorter settings are raised to 1h with a warning. If you ran an earlier version with a 10-minute backlog, see [CHANGELOG.md](CHANGELOG.md) for how to back-fill what it missed. The newest minutes also come as live copies, which are stored too; see [Live and final samples](#live-and-final-samples)
 - **Gap-filling**: If the API or database was unavailable, the daemon automatically detects the gap on the next successful cycle and back-fills the missing data. It finds the gap by asking each backend for its newest stored point, so the token needs read access as well as write access. If a backend cannot be asked (a timeout, missing permission, or it is failing writes at that moment), the daemon resumes from the end of the last collection known to have completed (kept in `state.json`) instead of assuming an empty database. That mark is kept for the collector as a whole: a backend that rejected writes while another one kept working catches up once it accepts writes and answers lookups again. VictoriaMetrics needs v1.52 or later (`tlast_over_time()`)
+- **Gap re-checks**: Gateways upload the samples an outage missed late, so the daemon reads every gap in a sensor's data again 1h, 6h, 1d, 3d and 7d after it closed (`RECHECK_GAPS`, `0` turns it off). Without gaps this costs no API calls at an `INTERVAL` of 30 minutes or less, or of 60 minutes or more with the default `DEEP_SCAN_INTERVAL`; see [Gap re-checks](#gap-re-checks)
 - **Graceful shutdown**: Responds to SIGTERM/SIGINT for clean shutdown
 - **Error recovery**: Retries with exponential backoff on API or backend failures; never exits on transient errors
 - **Token refresh**: Proactively re-authenticates before the OAuth token expires

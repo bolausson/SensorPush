@@ -189,6 +189,14 @@ MIN_POLL_BACKLOG_MIN = 60
 #   gap_lookback  How far back get_last_timestamp() looks when locating
 #       existing data.  '0' = no limit.  Must exceed the longest outage the
 #       daemon should still be able to recover from.
+#   recheck_gaps  When to re-read a gap in a sensor's data, counted from the
+#       moment it closed (the sensor reported again).  Gateways upload missed
+#       samples late, so one read right after a gap misses them.  '0' (or
+#       off, false, no, none, empty) turns the re-checks off; the daemon then
+#       behaves exactly as it did without them.  Daemon mode only.
+#   recheck_min_gap  The shortest silence that counts as a gap.  At least
+#       15m: live copies of one sensor can be almost 13 minutes apart.
+#       The defaults of both are in DEFAULT_RECHECK_CFG.
 DEFAULT_DAEMON_CFG = {
     'interval': 300,
     'poll_backlog': '1h',
@@ -199,6 +207,131 @@ DEFAULT_DAEMON_CFG = {
     'gap_lookback': '0',
     'sensor_stale_after': '6h',
 }
+
+# Kept out of DEFAULT_DAEMON_CFG, and added to a loaded config only when the
+# file sets them, so a config without them loads exactly as before.
+DEFAULT_RECHECK_CFG = {
+    'recheck_gaps': '1h, 6h, 1d, 3d, 7d',
+    'recheck_min_gap': '20m',
+}
+
+# -----------------------------------------------------------------------------
+# Gap re-checks
+# -----------------------------------------------------------------------------
+# After an outage the cloud fills in the past late: a gateway uploads a small
+# backlog within about an hour, HT1 history can take hours to weeks.  So each
+# jump in a sensor's sample stream is recorded as a hole and read again
+# RECHECK_GAPS after it closed - see _note_fetched() and _recheck_gaps().
+#
+# Per cycle, re-reads make at most this many calls and take at most this long,
+# including the --delay sleeps between them, so they never hold up the polls.
+RECHECK_CALLS_PER_CYCLE = 6
+RECHECK_SECONDS_PER_CYCLE = 120
+# Cap of the back-off after a failed re-read call.
+RECHECK_BACKOFF_MAX = 3600
+# A sensor that keeps dropping out cannot pile up holes without bound: beyond
+# this many, its two closest holes are merged (nothing is dropped).
+RECHECK_HOLES_PER_SENSOR = 40
+# Nor can many sensors together: beyond this many holes in all, the closest
+# holes of the sensor with the most are merged.  state.json is rewritten
+# every cycle, and 100 sensors at the per-sensor cap would make it ~0.7 MiB.
+RECHECK_HOLES_MAX = 1000
+# Unread holes of one sensor this close together are read as one.
+RECHECK_MERGE_WITHIN = 6 * 3600
+# A hole is read from its start - 1h to its end + 1h.  The sensor's own
+# samples just before and after a gap often reach the cloud only with the
+# backlog; until then the database holds only live copies there.
+RECHECK_MARGIN = 3600
+# A re-read call reads a cell plus this much on either side, as every other
+# window overlaps the next: the newest hour is selected by chunk start.
+RECHECK_CALL_PAD = 30 * 60
+# A hole that is almost due rides along in a call that a due hole triggered:
+# up to this share of its offset early, and for the last offset at most
+# RECHECK_EARLY_LAST_MAX early, so the horizon stays where it is.
+RECHECK_EARLY_SHARE = 0.25
+RECHECK_EARLY_LAST_MAX = 30 * 60
+# Polls at most this far apart see the data live: the API serves a live copy
+# of each reading for about 30 minutes, so in such a stretch every reading
+# was seen, and a jump in it is a real gap.
+RECHECK_LIVE_TOLERANCE = 25 * 60
+# A fetched window whose stop is at most this far in the past reaches the
+# present, i.e. it was served live copies.
+RECHECK_PRESENT_WITHIN = 10 * 60
+# Threshold for sensors that skip unchanged readings (HT1) in data that was
+# not seen live: their own records have gaps of up to 63 min (the most in 103
+# days of 12 sensors), so a shorter jump there proves nothing.
+RECHECK_SETTLED_MIN_GAP = 90 * 60
+# Types that record every minute without skipping: no own record is more
+# than 65 s from the next (148k samples), so any jump over RECHECK_MIN_GAP
+# is a gap, live or not.
+ONE_PER_MINUTE_TYPES = frozenset({'HTP.xw', 'HT.w'})
+# Days of samples a sensor keeps on board.  Older parts of a long gap can
+# never reach the cloud and are not re-read.  Unknown types: the longest.
+STORAGE_DAYS = {'HT1': 20, 'HTP.xw': 30, 'HT.w': 45}
+STORAGE_DAYS_UNKNOWN = 45
+# A hole clamped to on-board storage keeps at most this much more than the
+# storage, so that its cells line up with those of the other sensors of an
+# outage (see _storage_start); a hole restored from state.json may be this
+# much longer than the storage.  Not a cell: cells shrink after a hole was
+# saved (a lowered -t, a truncated answer).
+RECHECK_SPAN_SLACK = 86400
+# Only samples at least this old count when deciding whether a re-read found
+# more than any before: live copies vanish after ~30 minutes, so counting
+# them could hide own samples that arrived meanwhile.
+RECHECK_SETTLED_AGE = 35 * 60
+# Re-read records are written in slices of at most this many: one write of
+# a long hole could exceed InfluxDB 3's 10 MiB request limit or a
+# VictoriaMetrics timeout.
+RECHECK_WRITE_SLICE = 5000
+# A hole whose re-read fails this many times in a row is dropped.
+RECHECK_HOLE_MAX_ERRORS = 3
+# A one-cell hole of a ONE_PER_MINUTE_TYPES sensor is complete - no more
+# re-reads - when its interior has no step over RECHECK_COMPLETE_STEP and
+# reaches within RECHECK_COMPLETE_EDGE of both ends (own records are at most
+# 65 s apart).
+RECHECK_COMPLETE_STEP = 90
+RECHECK_COMPLETE_EDGE = 180
+# A hole longer than this whose first re-read found nothing is next read at
+# the first offset of at least RECHECK_EMPTY_SKIP_TO: a sensor whose trip
+# data never reaches the cloud then costs 3 passes, not 5, while late HT1
+# history is still caught by the 3d and 7d reads.
+RECHECK_EMPTY_LONG = 86400
+RECHECK_EMPTY_SKIP_TO = 3 * 86400
+# Values of RECHECK_GAPS that turn the re-checks off (any case).
+RECHECK_OFF_VALUES = ('', '0', 'off', 'false', 'no', 'none')
+# RECHECK_GAPS offsets are at most 90 days (no sensor keeps more than 45 on
+# board) and at least 30 minutes: sooner, the gateway has hardly begun to
+# upload, and the polls re-read the newest hour anyway.
+RECHECK_OFFSET_MAX_MIN = 90 * 24 * 60
+RECHECK_OFFSET_FLOOR_MIN = 30
+# RECHECK_MIN_GAP floor: live copies of one sensor can be 12.8 min apart.
+RECHECK_MIN_GAP_FLOOR_MIN = 15
+# The API hands out a sensor's samples in chunks of about RECHECK_CHUNK and
+# selects the newest RECHECK_CHUNK_SELECT of data by a chunk's start: a
+# window that starts there can miss up to one chunk after its start.
+RECHECK_CHUNK = 15 * 60
+RECHECK_CHUNK_SELECT = 3600
+# Shortest cell, in minutes.  A truncated re-read answer halves the cells of
+# the holes it served, down to this.
+RECHECK_CELL_MIN = 30
+# A cell whose re-read calls fail this many times in a row is skipped for
+# the current pass (the next pass reads it again): a window that can never
+# be read or written must not hold up the other holes.  From its second
+# failed call on, a cell is read alone, on the back-off that all cells read
+# alone share (see _recheck_gaps).
+RECHECK_CELL_MAX_FAILS = 3
+# The last pass has no next one: there a cell is not skipped but kept, and
+# tried again alone (kept cells take every other read alone after the
+# others, unless a backend refused their records, see _recheck_pick); only
+# a call that fails more than this long after the last offset gives it up,
+# so the tries of that day can outlast a spell of failed calls.  A pass is
+# also the last when it began after the last offset: the offsets after it
+# collapse into it.
+RECHECK_LAST_PASS_GRACE = 86400
+# Times restored from state.json lie between 2015-01-01 (no SensorPush data
+# is older) and one day ahead of the clock; anything else is damage.
+RECHECK_EPOCH_MIN = 1420070400
+RECHECK_FUTURE_SLACK = 86400
 
 
 # -----------------------------------------------------------------------------
@@ -272,7 +405,7 @@ def _load_legacy_influxdb2(config):
         },
         'influxdb3': None,
         'victoriametrics': None,
-        'daemon': dict(DEFAULT_DAEMON_CFG),
+        'daemon': _read_recheck_keys(config, dict(DEFAULT_DAEMON_CFG)),
     }
 
 
@@ -293,8 +426,24 @@ def _load_legacy_vm(config):
             'verify_ssl': config['VICTORIAMETRICSCONF'].getboolean('VM_VERIFY_SSL', False),
             'sensor_uid': config['VICTORIAMETRICSCONF'].getboolean('SENSOR_UID', fallback=False),
         },
-        'daemon': dict(DEFAULT_DAEMON_CFG),
+        'daemon': _read_recheck_keys(config, dict(DEFAULT_DAEMON_CFG)),
     }
+
+
+def _read_recheck_keys(config, daemon_cfg):
+    """Add RECHECK_GAPS / RECHECK_MIN_GAP from [DAEMON], if the file sets them.
+
+    The only [DAEMON] keys a legacy config file honours, so its users can
+    turn the re-checks off too.  Keys the file does not set stay out of the
+    dict; the daemon then uses DEFAULT_RECHECK_CFG.
+    """
+    for key in DEFAULT_RECHECK_CFG:
+        if config.has_option('DAEMON', key.upper()):
+            # Raw: a '%' in the value would fail the interpolation, and with
+            # it loading the file in every mode.  The parsers reject it in
+            # daemon mode with a one-line error; one-shot mode ignores it.
+            daemon_cfg[key] = config.get('DAEMON', key.upper(), raw=True)
+    return daemon_cfg
 
 
 def _load_unified(config):
@@ -330,6 +479,7 @@ def _load_unified(config):
                 'DAEMON', 'SENSOR_STALE_AFTER', fallback='6h'),
         },
     }
+    _read_recheck_keys(config, cfg['daemon'])
 
     if 'INFLUXDB2' in config:
         url = config.get('INFLUXDB2', 'URL', fallback='http://localhost:8086')
@@ -438,6 +588,10 @@ SENSOR_RETURN_GRACE = 1h
 GAP_LOOKBACK = 0
 # How far a sensor may lag the others before it counts as missing.
 SENSOR_STALE_AFTER = 6h
+# When to re-read a gap after it closed (gateways upload late); 0 = off.
+# RECHECK_GAPS = 1h, 6h, 1d, 3d, 7d
+# The shortest silence of a sensor that counts as a gap.
+# RECHECK_MIN_GAP = 20m
 
 [MISC]
 MY_ALTITUDE = 0.0
@@ -607,6 +761,100 @@ def parse_timestamp_to_ms(timestamp):
             dt = datetime.datetime.strptime(timestamp.split('.')[0], '%Y-%m-%dT%H:%M:%S')
         return int(dt.timestamp() * 1000)
     return int(timestamp * 1000)
+
+
+_OFFSET_NO_COLON = re.compile(r'([+-])(\d{2})(\d{2})$')
+_OBSERVED_FORMATS = ('%Y-%m-%dT%H:%M:%S.%f%z', '%Y-%m-%dT%H:%M:%S%z',
+                     '%Y-%m-%dT%H:%M:%S.%f', '%Y-%m-%dT%H:%M:%S')
+
+
+def _observed_epoch(value):
+    """Epoch seconds of an API 'observed' time or a daemon window bound.
+
+    Takes '2026-11-08T10:00:00.000Z', '+00:00' and '+0100' offsets (the
+    window strings are '%Y-%m-%dT%X%z') and naive strings, read as UTC.
+    Returns None for anything unparseable.  Before Python 3.11,
+    fromisoformat() accepts neither a trailing 'Z' nor '+HHMM', so both are
+    rewritten first; strptime() covers what is left (e.g. fractions that are
+    not 3 or 6 digits long).
+    """
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if text[-1:] in ('Z', 'z'):
+        text = text[:-1] + '+00:00'
+    text = _OFFSET_NO_COLON.sub(r'\1\2:\3', text)
+    try:
+        dt = datetime.datetime.fromisoformat(text)
+    except ValueError:
+        dt = None
+        for fmt in _OBSERVED_FORMATS:
+            try:
+                dt = datetime.datetime.strptime(text, fmt)
+                break
+            except ValueError:
+                continue
+        if dt is None:
+            return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=datetime.timezone.utc)
+    try:
+        return dt.timestamp()
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def _duration_min(text):
+    """parse_backlog(), but None instead of an exception."""
+    try:
+        return parse_backlog(text)
+    except (ValueError, KeyError, IndexError, TypeError):
+        return None
+
+
+def parse_recheck_gaps(value):
+    """RECHECK_GAPS -> its offsets in seconds, sorted and distinct; [] = off.
+
+    Raises ValueError with a one-line reason if the value is invalid.
+    """
+    text = str(value).strip()
+    if text.lower() in RECHECK_OFF_VALUES:
+        return []
+    minutes = []
+    for item in text.split(','):
+        item = item.strip()
+        m = _duration_min(item)
+        if m is None:
+            raise ValueError(
+                f"RECHECK_GAPS = {value!r}: {item!r} is not a time such as "
+                f"30m, 6h or 3d (0 turns gap re-checks off)")
+        if m <= 0 or m > RECHECK_OFFSET_MAX_MIN:
+            raise ValueError(
+                f"RECHECK_GAPS = {value!r}: {item!r} is not more than 0 and "
+                f"at most 90d (0 turns gap re-checks off)")
+        minutes.append(m)
+    if min(minutes) < RECHECK_OFFSET_FLOOR_MIN:
+        logger.warning(
+            "RECHECK_GAPS = %s: offsets under %dm are raised to %dm; sooner, "
+            "the gateway has hardly begun to upload", value,
+            RECHECK_OFFSET_FLOOR_MIN, RECHECK_OFFSET_FLOOR_MIN)
+        minutes = [max(m, RECHECK_OFFSET_FLOOR_MIN) for m in minutes]
+    return sorted({m * 60 for m in minutes})
+
+
+def parse_recheck_min_gap(value):
+    """RECHECK_MIN_GAP -> seconds.  Raises ValueError if it is invalid."""
+    m = _duration_min(str(value).strip())
+    if m is None or m <= 0:
+        raise ValueError(
+            f"RECHECK_MIN_GAP = {value!r} is not a time such as 20m or 1h")
+    if m < RECHECK_MIN_GAP_FLOOR_MIN:
+        logger.warning(
+            "RECHECK_MIN_GAP = %s is raised to %dm: live copies of one sensor "
+            "can be almost 13 minutes apart, so a shorter silence is not a gap",
+            value, RECHECK_MIN_GAP_FLOOR_MIN)
+        m = RECHECK_MIN_GAP_FLOOR_MIN
+    return m * 60
 
 
 # -----------------------------------------------------------------------------
@@ -1343,6 +1591,217 @@ def process_samples(samples, sensors, measurement_name, my_altitude, noconvert):
 
 
 # -----------------------------------------------------------------------------
+# Gap re-checks: holes and their cells
+# -----------------------------------------------------------------------------
+# A hole is a dict, kept in state.json under rechecks.holes with these keys:
+#   sid        API sensor id
+#   start/end  observed times (epoch) of the last sample before and the
+#              first sample after the gap; the data of interest lies
+#              strictly between them, in the interior
+#   closed_at  when the hole was registered (time.time())
+#   done       completed re-read passes
+#   pos        next cell of the current pass; 0 between passes
+#   cell       cell length in minutes, set at registration; halved when a
+#              re-read answer was truncated
+#   counts     per cell, the most settled interior samples any read found
+#   probe      None for a gap.  A number (seconds) for a stretch a fetched
+#              window did not reach although no gap was seen: its first
+#              pass writes what it holds, then it is dropped if no step in
+#              it is longer than that, and read on as a gap otherwise.  Two
+#              probes merged by a cap stay a probe (the smaller number).
+# Keys starting with '_' exist in memory only.
+#
+# The read range [start - RECHECK_MARGIN, end + RECHECK_MARGIN] is split into
+# cells of `cell` minutes, one call each, read in order: a long hole is read
+# over several cycles, and a count is always compared over the same range.
+HOLE_KEYS = ('sid', 'start', 'end', 'closed_at', 'done', 'pos', 'cell',
+             'counts', 'probe')
+# In-memory keys of a hole, dropped whenever its cells or its pass change.
+# '_fail' is the failure record of the cell about to be read (see
+# _fail_record); '_since' is when the pass began: its first cell read or
+# skipped (see _last_pass).
+_HOLE_PASS_KEYS = ('_found', '_new', '_chain', '_fail', '_partial',
+                   '_qwarned', '_since')
+_HOLE_SPAN_MAX = (max(list(STORAGE_DAYS.values()) + [STORAGE_DAYS_UNKNOWN])
+                  + 1) * 86400
+
+
+def _hole_ncells(hole):
+    """Number of cells of a hole's read range."""
+    span = hole['end'] - hole['start'] + 2 * RECHECK_MARGIN
+    # The tolerance keeps float noise from adding an empty last cell.
+    return max(1, int(math.ceil(span / (hole['cell'] * 60.0) - 1e-9)))
+
+
+def _hole_cell(hole, k):
+    """Bounds (epoch) of cell k of a hole; the last one ends at end + margin."""
+    c = hole['start'] - RECHECK_MARGIN + k * hole['cell'] * 60
+    if k >= _hole_ncells(hole) - 1:
+        return c, hole['end'] + RECHECK_MARGIN
+    return c, c + hole['cell'] * 60
+
+
+def _is_number(v):
+    """A finite JSON number (bool is an int in Python, but not one here)."""
+    if not isinstance(v, (int, float)) or isinstance(v, bool):
+        return False
+    try:
+        return math.isfinite(v)
+    except OverflowError:               # an int too large for a float
+        return False
+
+
+def _is_count(v):
+    """A non-negative JSON integer."""
+    return isinstance(v, int) and not isinstance(v, bool) and v >= 0
+
+
+def _plausible_time(v, now):
+    """An epoch from state.json that this daemon could have written."""
+    return _is_number(v) and RECHECK_EPOCH_MIN <= v <= now + RECHECK_FUTURE_SLACK
+
+
+def _valid_hole(entry, now):
+    """A hole read back from state.json, checked field by field.
+
+    Returns a clean copy, or None if the entry is malformed - also when it
+    holds values the daemon never writes (times before 2015 or more than a
+    day ahead of ``now``), which would break the date arithmetic or keep a
+    hole that is never due.  Counts that do not fit the hole's cells are
+    reset (and the pass restarts) rather than trusted.
+    """
+    try:
+        return _checked_hole(entry, now)
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _checked_hole(entry, now):
+    if not isinstance(entry, dict):
+        return None
+    sid = entry.get('sid')
+    if not isinstance(sid, str) or not sid:
+        return None
+    if not all(_plausible_time(entry.get(k), now)
+               for k in ('start', 'end', 'closed_at')):
+        return None
+    if not (_is_count(entry.get('done')) and _is_count(entry.get('pos'))
+            and _is_count(entry.get('cell'))
+            and entry['cell'] >= RECHECK_CELL_MIN):
+        return None
+    probe = entry.get('probe')
+    if probe is not None and not (_is_number(probe) and probe > 0):
+        return None
+    hole = {'sid': sid, 'start': float(entry['start']),
+            'end': float(entry['end']), 'closed_at': float(entry['closed_at']),
+            'done': entry['done'], 'pos': entry['pos'], 'cell': entry['cell'],
+            'probe': None if probe is None else float(probe)}
+    # The detector never registers a hole longer than on-board storage plus
+    # RECHECK_SPAN_SLACK (see _storage_start); one that is (a damaged file)
+    # would cost a call per cell for nothing.  The bound must not depend on
+    # the hole's cell: that shrinks after the hole was saved.
+    if not (0 < hole['end'] - hole['start']
+            <= _HOLE_SPAN_MAX + RECHECK_SPAN_SLACK):
+        return None
+    n = _hole_ncells(hole)
+    counts = entry.get('counts')
+    if (isinstance(counts, list) and len(counts) == n
+            and all(_is_count(c) for c in counts)):
+        hole['counts'] = list(counts)
+    else:
+        hole['counts'] = [0] * n
+        hole['pos'] = 0
+    if hole['pos'] >= n:
+        hole['pos'] = 0
+    return hole
+
+
+def _chain_steps(hole, chain):
+    """The steps of a pass's settled interior samples, from start to end.
+
+    ``chain`` is what _advance_hole() collected over a pass that read every
+    cell in order.  Returns (start to first sample, largest step between
+    samples, last sample to end), or None when there was no interior sample.
+    """
+    if chain['last'] is None:
+        return None
+    return (chain['first'], chain['inner'], hole['end'] - chain['last'])
+
+
+def _interior_complete(hole, chain):
+    """True if a pass found the interior of a hole complete.
+
+    For sensors that record every minute: no step between samples over
+    RECHECK_COMPLETE_STEP, and none at either end over RECHECK_COMPLETE_EDGE.
+    """
+    steps = _chain_steps(hole, chain)
+    return (steps is not None and steps[0] <= RECHECK_COMPLETE_EDGE
+            and steps[1] <= RECHECK_COMPLETE_STEP
+            and steps[2] <= RECHECK_COMPLETE_EDGE)
+
+
+def _largest_step(hole, chain):
+    """The longest stretch without a sample that a pass found in a hole."""
+    steps = _chain_steps(hole, chain)
+    return hole['end'] - hole['start'] if steps is None else max(steps)
+
+
+def _fmt_offset(seconds):
+    """3600 -> '1h', 86400 -> '1d', 1800 -> '30m' (for logs)."""
+    minutes = int(round(seconds / 60.0))
+    if minutes and minutes % 1440 == 0:
+        return f'{minutes // 1440}d'
+    if minutes and minutes % 60 == 0:
+        return f'{minutes // 60}h'
+    return f'{minutes}m'
+
+
+def _fmt_duration(seconds):
+    """The length of a gap, for logs: '130 min', '7.5 h', '3.2 days'."""
+    if seconds < 3 * 3600:
+        return f'{seconds / 60:.0f} min'
+    if seconds < 2 * 86400:
+        return f'{seconds / 3600:.1f} h'
+    return f'{seconds / 86400:.1f} days'
+
+
+def _fmt_failed(calls):
+    """'failed once' / 'failed 3 times in a row', for logs: the failed
+    calls made for a cell in this pass.  Not its failure count: a carry
+    starts that one short of RECHECK_CELL_MAX_FAILS, a regroup sets it
+    back."""
+    if calls == 1:
+        return 'failed once'
+    return f'failed {calls} times in a row'
+
+
+def _fmt_time(t):
+    """An epoch in local time, for logs (never raises)."""
+    try:
+        return datetime.datetime.fromtimestamp(t).strftime('%Y-%m-%d %H:%M')
+    except (OverflowError, OSError, ValueError, TypeError):
+        return repr(t)
+
+
+def _fmt_span(start, end, now):
+    """'03:00-05:10' in local time, with the date when it is not today.
+
+    Never raises: a log line must not be what stops the re-checks.
+    """
+    try:
+        s = datetime.datetime.fromtimestamp(start)
+        e = datetime.datetime.fromtimestamp(end)
+        if s.date() == e.date():
+            span = f'{s:%H:%M}-{e:%H:%M}'
+            if s.date() == datetime.datetime.fromtimestamp(now).date():
+                return span
+            return f'{s:%Y-%m-%d} {span}'
+        return f'{s:%Y-%m-%d %H:%M} - {e:%Y-%m-%d %H:%M}'
+    except (OverflowError, OSError, ValueError, TypeError):
+        return f'{start!r}-{end!r}'
+
+
+# -----------------------------------------------------------------------------
 # Daemon
 # -----------------------------------------------------------------------------
 class SensorPushDaemon:
@@ -1390,6 +1849,37 @@ class SensorPushDaemon:
         self._reported_collisions = set()
         self._logged_id_map = False
         self._warned_backlog = False
+        # Gap re-checks (RECHECK_GAPS), daemon mode only: holes found in the
+        # fetched sample streams, re-read on a schedule because gateways
+        # upload missed samples late.  See _note_fetched()/_recheck_gaps().
+        # Parsed before anything is fetched: an invalid value ends the
+        # process right here.
+        self._recheck_offsets, self._recheck_min_gap = self._recheck_settings()
+        self._recheck_on = bool(self._recheck_offsets) and bool(args.daemon)
+        # Persisted (state.json, key 'rechecks') only while the feature is
+        # on: the newest observed time per sensor, and the holes.
+        self._recheck_last_seen = {}
+        self._recheck_holes = []
+        # In memory only: the current stretch of live polling, what the
+        # windows of the current cycle have read, the back-off of the
+        # re-reads read together and that of the cells read alone (failed
+        # calls in a row, and until when - monotonic; see _recheck_gaps),
+        # whether the next read alone after the others goes to the kept
+        # kind (see _recheck_pick), whether re-reads wait for a backend, and
+        # once-only warnings.
+        self._live_since = None
+        self._live_poll_at = None
+        self._cycle_cover = []
+        self._recheck_fail_streak = 0
+        self._recheck_next_at = None
+        self._recheck_alone_streak = 0
+        self._recheck_alone_next_at = None
+        self._recheck_kept_next = True
+        self._recheck_writers_waiting = False
+        self._recheck_warned = set()
+        self._recheck_cap_warned = {}
+        self._recheck_total_warned = None
+        self._note_warned = False
         self._state_path = self._resolve_state_path()
         self._load_state()
         self._setup_signals()
@@ -1478,6 +1968,8 @@ class SensorPushDaemon:
             except Exception as e:
                 logger.warning("Could not read state file %s: %s",
                                self._state_path, e)
+        if self._recheck_on:
+            self._load_recheck_state()
         if not current_format:
             self._adopt_last_success_marker()
 
@@ -1578,6 +2070,13 @@ class SensorPushDaemon:
             'collected_until': (self._collected_until.isoformat()
                                 if self._collected_until is not None else None),
         }
+        # Only while the feature is on: off, the file is exactly what it was
+        # without it (and an older release drops the key on its next save).
+        if self._recheck_on:
+            try:
+                payload['rechecks'] = self._recheck_payload()
+            except Exception as e:
+                logger.warning("Could not save the gap re-checks: %s", e)
         tmp = None
         try:
             fd, tmp = tempfile.mkstemp(dir=str(self._state_path.parent),
@@ -1787,6 +2286,9 @@ class SensorPushDaemon:
         mytz = datetime.timezone(datetime.timedelta(hours=local_time_offset()))
         currenttime = datetime.datetime.now(tz=mytz)
         measurement_name = self._get_measurement_name()
+        if self._recheck_on:
+            # What this cycle's windows have read (see _note_fetched).
+            self._cycle_cover = []
 
         # Authenticate, reusing the cached token while it is still valid.
         # Re-authenticating every cycle multiplied exposure to auth outages
@@ -1867,6 +2369,21 @@ class SensorPushDaemon:
         if self.args.daemon and deep_scan:
             self._handle_sensor_returns(sensors, measurement_name, currenttime)
             state_dirty = True
+
+        # Re-read the recorded gaps that are due.  Only after a main fetch
+        # that landed completely - with the API or every backend down they
+        # would fail as well - and isolated: an error here costs at most the
+        # re-checks, never the collection.
+        if self._recheck_on:
+            if self.running and all_ok:
+                try:
+                    self._recheck_gaps(sensors, measurement_name)
+                except Exception:
+                    logger.error("Gap re-check failed; collection is not "
+                                 "affected", exc_info=True)
+            # Every fetch updates what the re-checks know (_note_fetched).
+            state_dirty = True
+            self._note_warned = False
 
         if state_dirty:
             self._save_state()
@@ -2315,6 +2832,1343 @@ class SensorPushDaemon:
                     pass
         self._save_state()
 
+    # -- gap re-checks ------------------------------------------------------
+
+    def _recheck_settings(self):
+        """Parse RECHECK_GAPS and RECHECK_MIN_GAP (daemon mode only).
+
+        Returns (offsets in seconds, min gap in seconds); no offsets means
+        off, and one-shot mode ignores both keys.  An invalid value ends the
+        process with status 2 before anything is fetched or connected:
+        running without the re-checks someone configured - or with the ones
+        they meant to turn off - would only be noticed much later.
+        """
+        if not self.args.daemon:
+            return [], 0
+        daemon_cfg = self.config['daemon']
+        try:
+            offsets = parse_recheck_gaps(daemon_cfg.get(
+                'recheck_gaps', DEFAULT_RECHECK_CFG['recheck_gaps']))
+            if not offsets:
+                return [], 0
+            min_gap = parse_recheck_min_gap(daemon_cfg.get(
+                'recheck_min_gap', DEFAULT_RECHECK_CFG['recheck_min_gap']))
+        except ValueError as e:
+            logger.error("Invalid [DAEMON] setting: %s", e)
+            sys.exit(2)
+        logger.info("Gap re-checks: gaps over %s are read again %s after they "
+                    "close (RECHECK_GAPS = 0 turns this off)",
+                    _fmt_offset(min_gap),
+                    ', '.join(_fmt_offset(o) for o in offsets))
+        return offsets, min_gap
+
+    def _recheck_cell_min(self):
+        """Cell length L in minutes for new holes.
+
+        A call reads a cell plus RECHECK_CALL_PAD on either side, so with
+        this L a re-read window is as long as every other window (-t).
+        """
+        return max(RECHECK_CELL_MIN, int(self.args.timestep) - 60)
+
+    def _load_recheck_state(self):
+        """Restore the gap re-checks from state.json (key 'rechecks').
+
+        Read separately from the other keys on purpose: nothing wrong here
+        may affect the pending back-fills, the failed windows or the
+        collection mark.  Malformed entries are dropped one by one, with one
+        WARNING for all of them.
+        """
+        if not self._state_path or not self._state_path.is_file():
+            return
+        try:
+            with open(self._state_path) as f:
+                data = json.load(f)
+            raw = data.get('rechecks') if isinstance(data, dict) else None
+            if raw is None:
+                return
+            if not isinstance(raw, dict):
+                raise ValueError("'rechecks' is not an object")
+            now = time.time()
+            dropped = 0
+            raw_seen = raw.get('last_seen', {})
+            if not isinstance(raw_seen, dict):
+                dropped += 1
+                raw_seen = {}
+            last_seen = {}
+            for sid, ts in raw_seen.items():
+                # One by one: a bad value costs its own entry only.  One far
+                # ahead would turn the gap detection off for that sensor.
+                if _plausible_time(ts, now):
+                    last_seen[str(sid)] = float(ts)
+                else:
+                    dropped += 1
+            raw_holes = raw.get('holes', [])
+            if not isinstance(raw_holes, list):
+                dropped += 1
+                raw_holes = []
+            holes = []
+            cell = self._recheck_cell_min()
+            for entry in raw_holes:
+                hole = _valid_hole(entry, now)
+                if hole is None:
+                    dropped += 1
+                    continue
+                if hole['cell'] > cell:
+                    # -t was lowered since, which is the cure for truncated
+                    # answers: read the hole in the new, smaller cells.
+                    hole['cell'] = cell
+                    hole['counts'] = [0] * _hole_ncells(hole)
+                    hole['pos'] = 0
+                offs = self._recheck_offsets
+                if hole['pos'] > 0 and hole['done'] < len(offs):
+                    # state.json does not keep when a pass began; for one
+                    # under way before the restart, take its due time.
+                    # Unless it is the last offset's pass, it is then not
+                    # the last pass (see _last_pass), and the cells it read
+                    # before the restart still get the last read.
+                    hole['_since'] = hole['closed_at'] + offs[hole['done']]
+                holes.append(hole)
+            if dropped:
+                logger.warning("Dropped %d malformed gap re-check entr%s from "
+                               "%s", dropped, 'y' if dropped == 1 else 'ies',
+                               self._state_path)
+            self._recheck_last_seen = last_seen
+            self._recheck_holes = holes
+            if holes:
+                logger.info("Restored %d gap(s) to re-check", len(holes))
+        except Exception as e:
+            logger.warning("Could not read the gap re-checks from %s: %s",
+                           self._state_path, e)
+
+    def _recheck_payload(self):
+        """The 'rechecks' value for state.json: persisted keys only."""
+        return {
+            'last_seen': dict(self._recheck_last_seen),
+            'holes': [{k: (list(h[k]) if k == 'counts' else h.get(k))
+                       for k in HOLE_KEYS} for h in self._recheck_holes],
+        }
+
+    def _warn_once(self, key, msg, *args):
+        """Log a WARNING once per process for each key."""
+        if key not in self._recheck_warned:
+            self._recheck_warned.add(key)
+            logger.warning(msg, *args)
+
+    def _note_fetched_safely(self, samples, sensors, window,
+                             sensor_filter=None):
+        """_note_fetched(), isolated: an error costs the gap detection only.
+
+        It runs inside _fetch_and_write_window()'s retry loop, after the
+        window was handled; an exception escaping from here would fetch and
+        write the window again, or record it as failed.  ``sensor_filter``
+        is the window's sensor list (None: all sensors).
+        """
+        try:
+            only = ({str(s) for s in sensor_filter} if sensor_filter
+                    else None)
+            self._note_fetched(samples, sensors, window, only)
+        except Exception as e:
+            if not self._note_warned:
+                self._note_warned = True
+                logger.warning("Gap detection failed for window %s (%s); "
+                               "collection is not affected", window, e)
+            logger.debug("Gap detection error", exc_info=True)
+
+    def _note_fetched(self, samples, sensors, window, only=None):
+        """Record the holes in the sample streams of a fetched window.
+
+        Sees every window the daemon fetches anyway - polls, deep-scan and
+        collector-gap windows, retried failed windows, the 6-h path's
+        back-fills - but not the re-reads.  A sensor's stream is compared
+        with the newest sample seen before (its last_seen; on the first
+        cycle after an upgrade, the newest point in the database), so only
+        what is new counts and fetching a window again finds nothing.
+        ``only`` is the set of sensors the window was fetched for (None:
+        all of them).
+
+        A jump of more than the threshold is a hole.  HT1 sensors skip
+        unchanged readings in their own records (gaps up to 63 min are
+        normal), but while the daemon polls continuously the API also
+        serves every reading as a live copy, at most ~13 min apart.  So for
+        HT1-like types RECHECK_MIN_GAP applies only to a jump that was
+        observed live, RECHECK_SETTLED_MIN_GAP otherwise; types that record
+        every minute always use RECHECK_MIN_GAP.
+
+        A window can also start after a sensor's newest sample seen so far:
+        after a silence of about 45 minutes or more, after the daemon paused
+        that long, or with polls more than 30 minutes apart.  What the cloud
+        holds in between was then never fetched, and the jump to the
+        window's first sample says nothing about it - the API even leaves
+        out up to one chunk after the start of a window in the newest hour.
+        Such a stretch is recorded whatever its length: as a hole if the
+        jump is longer than the threshold, else as a probe, read once to
+        fetch what it holds.  A probe is checked against the same threshold
+        as the jump: its re-read sees only own records, which in HT1-like
+        data not seen live skip up to an hour.
+        """
+        now = time.time()
+        lo = _observed_epoch(window[0])
+        stop = _observed_epoch(window[1])
+        reaches_present = (stop is not None
+                           and stop >= now - RECHECK_PRESENT_WITHIN)
+        if reaches_present:
+            if (self._live_poll_at is None
+                    or now - self._live_poll_at > RECHECK_LIVE_TOLERANCE):
+                # A new stretch of live polling.  The API still serves live
+                # copies of about the last 30 minutes, so from here on
+                # (with a margin) every reading is seen.
+                self._live_since = now - RECHECK_LIVE_TOLERANCE
+            self._live_poll_at = now
+        # From where on this window returns everything the cloud holds.
+        covered = None
+        if lo is not None:
+            covered = (lo + RECHECK_CHUNK
+                       if lo > now - RECHECK_CHUNK_SELECT - RECHECK_CHUNK
+                       else lo)
+        wanted = ({str(s) for s in self.args.sensorlist}
+                  if self.args.sensorlist else None)
+        min_gap = self._recheck_min_gap
+        settled_gap = max(min_gap, RECHECK_SETTLED_MIN_GAP)
+        # A sample from the future (a sensor or gateway clock gone wrong)
+        # would hold last_seen ahead and hide every gap until then.
+        future = now + RECHECK_PRESENT_WITHIN
+        probes = []
+        for sid, items in (samples.get('sensors') or {}).items():
+            if sid not in sensors or (wanted is not None
+                                      and str(sid) not in wanted):
+                continue
+            times = set()
+            unparseable = ahead = 0
+            for item in items or ():
+                t = (_observed_epoch(item.get('observed'))
+                     if isinstance(item, dict) else None)
+                if t is None:
+                    unparseable += 1
+                elif t > future:
+                    ahead += 1
+                else:
+                    times.add(t)
+            if unparseable:
+                self._warn_once(
+                    ('observed', sid), "Sensor '%s': %d sample(s) without a "
+                    "readable observed time are left out of gap detection "
+                    "(reported once)", sensors[sid].get('name', sid),
+                    unparseable)
+            if ahead:
+                self._warn_once(
+                    ('future', sid), "Sensor '%s': %d sample(s) observed in "
+                    "the future are left out of gap detection (reported "
+                    "once)", sensors[sid].get('name', sid), ahead)
+            if not times:
+                continue
+            times = sorted(times)
+            prev = self._recheck_last_seen.get(sid)
+            if prev is None:
+                stored = self._sensor_last_stored.get(sid)
+                prev = stored.timestamp() if stored is not None else None
+            # The window does not reliably cover the time right after prev,
+            # and no earlier window of this cycle read it.  (A sample at or
+            # before prev in the answer proves nothing: older than an hour,
+            # it is selected by its own time, the chunks after it by theirs.)
+            unread = (prev is not None and covered is not None
+                      and prev < covered
+                      and not self._cycle_covered(sid, prev, covered))
+            if prev is None:
+                # No baseline at all (a new sensor): its first sample is.
+                prev = times[0]
+            every_minute = sensors[sid].get('type') in ONE_PER_MINUTE_TYPES
+            for t in times:
+                if t <= prev:
+                    continue
+                live = (reaches_present and self._live_since is not None
+                        and prev >= self._live_since)
+                threshold = min_gap if every_minute or live else settled_gap
+                if unread and t - prev <= threshold:
+                    # No gap seen, but the stretch was not read: a probe.
+                    # Its re-read is checked against this threshold too.
+                    # (RECHECK_MIN_GAP for HT1 data not seen live turned
+                    # own-record skips into gaps at INTERVALs of 35-59 min
+                    # and after a daemon pause of 45-55 min.)
+                    self._register_hole(sid, prev, t, sensors, now=now,
+                                        probe=threshold)
+                    probes.append(sensors[sid].get('name', sid))
+                elif t - prev > threshold:
+                    self._register_hole(sid, prev, t, sensors, now=now)
+                unread = False
+                prev = t
+            seen = self._recheck_last_seen.get(sid)
+            self._recheck_last_seen[sid] = (times[-1] if seen is None
+                                            else max(seen, times[-1]))
+        if covered is not None and stop is not None:
+            self._cycle_cover.append((covered, min(stop, now), only))
+        if probes:
+            # DEBUG: with an INTERVAL of 40-59 min this is most cycles.  A
+            # probe whose re-read finds data logs that at INFO.
+            logger.debug(
+                "Window %s -> %s may lack what %s recorded right after the "
+                "newest sample seen before; reading that stretch again after "
+                "%s", window[0], window[1], ', '.join(sorted(probes)),
+                _fmt_offset(self._recheck_offsets[0]))
+
+    def _cycle_covered(self, sid, start, end):
+        """True if earlier windows of this cycle read [start, end] for sid."""
+        reach = start
+        for lo, hi, only in sorted(self._cycle_cover, key=lambda c: c[0]):
+            if only is not None and sid not in only:
+                continue
+            if lo > reach:
+                break
+            reach = max(reach, hi)
+            if reach >= end:
+                return True
+        return False
+
+    @staticmethod
+    def _storage_start(start, end, info, cell):
+        """The earliest start a hole ending at end can usefully have.
+
+        A start beyond the sensor's on-board storage moves forward by whole
+        cells (of ``cell`` minutes), keeping a little more than the storage:
+        so the cells of the holes one outage leaves in sensors of different
+        types still line up, and one call serves them all.  Cells longer
+        than RECHECK_SPAN_SLACK (-t over 1500) keep at most that much more,
+        the most a hole restored from state.json may have.
+        """
+        days = STORAGE_DAYS.get(info.get('type'), STORAGE_DAYS_UNKNOWN)
+        earliest = end - (days + 1) * 86400
+        if start >= earliest:
+            return start
+        step = cell * 60
+        return max(start + math.floor((earliest - start) / step) * step,
+                   earliest - RECHECK_SPAN_SLACK)
+
+    def _register_hole(self, sid, start, end, sensors, now=None, probe=None):
+        """Record that sensor sid has no data between start and end.
+
+        start and end are the observed times of the last sample before and
+        the first sample after the gap.  ``now`` is its closed_at; holes
+        found in one fetch share it, so their re-reads fall due together.
+        ``probe`` (seconds) records a stretch a window did not read rather
+        than a gap seen (see _note_fetched); probes are not extended, only
+        merged by the caps.
+        """
+        if now is None:
+            now = time.time()
+        info = sensors.get(sid) or {}
+        name = info.get('name', sid)
+        cell = self._recheck_cell_min()
+        clamped = self._storage_start(start, end, info, cell)
+        if clamped > start:
+            logger.info(
+                "Gap in '%s' since %s: data before %s is beyond the sensor's "
+                "on-board storage and is not re-read", name, _fmt_time(start),
+                _fmt_time(clamped))
+            start = clamped
+        own = [h for h in self._recheck_holes if h['sid'] == sid]
+        # Only a hole no read has started on can still grow.
+        near = [h for h in own if h['done'] == 0 and h['pos'] == 0
+                and not h.get('probe') and probe is None
+                and h['end'] >= start - RECHECK_MERGE_WITHIN
+                and h['start'] <= end]
+        if near:
+            target = max(near, key=lambda h: h['end'])
+            target['end'] = max(target['end'], end)
+            target['start'] = self._storage_start(
+                min(target['start'], start), target['end'], info, cell)
+            target['cell'] = cell
+            target['counts'] = [0] * _hole_ncells(target)
+            for key in _HOLE_PASS_KEYS:
+                target.pop(key, None)
+            logger.info("Gap in '%s' extended: no data %s (%s)", name,
+                        _fmt_span(target['start'], target['end'], now),
+                        _fmt_duration(target['end'] - target['start']))
+            return
+        hole = {'sid': sid, 'start': start, 'end': end, 'closed_at': now,
+                'done': 0, 'pos': 0, 'cell': cell, 'probe': probe}
+        hole['counts'] = [0] * _hole_ncells(hole)
+        self._recheck_holes.append(hole)
+        own.append(hole)
+        if len(own) > RECHECK_HOLES_PER_SENSOR:
+            self._merge_closest_holes(own, info, cell,
+                                      RECHECK_HOLES_PER_SENSOR)
+            last = self._recheck_cap_warned.get(sid)
+            if last is None or now - last >= 86400:
+                self._recheck_cap_warned[sid] = now
+                logger.warning(
+                    "Sensor '%s' has more than %d gaps to re-check; its "
+                    "closest gaps are merged (reported once a day)", name,
+                    RECHECK_HOLES_PER_SENSOR)
+        if len(self._recheck_holes) > RECHECK_HOLES_MAX:
+            self._cap_all_holes(sensors, cell, now)
+        if probe is not None:
+            logger.debug("Sensor '%s': %s (%s) was not in the fetched window; "
+                         "reading it again after %s", name,
+                         _fmt_span(start, end, now), _fmt_duration(end - start),
+                         _fmt_offset(self._recheck_offsets[0]))
+            return
+        logger.info("Gap in '%s': no data %s (%s); re-reading it after %s",
+                    name, _fmt_span(start, end, now),
+                    _fmt_duration(end - start),
+                    ', '.join(_fmt_offset(o) for o in self._recheck_offsets))
+
+    def _merge_closest_holes(self, own, info, cell, keep):
+        """Merge one sensor's two closest holes until it has ``keep``.
+
+        Nothing is dropped: the merged hole covers both and is read in full
+        from its earlier schedule.  Only holes whose union fits in on-board
+        storage are merged, so no storage clamp cuts off what either holds.
+        Two probes merged stay a probe, checked against the stricter of
+        their thresholds; a probe merged with a gap is a gap.  Returns False
+        if no pair could be merged before ``own`` was down to ``keep``.
+        """
+        while len(own) > keep:
+            ordered = sorted(own, key=lambda h: (h['start'], h['end']))
+            pairs = [(a, b) for a, b in zip(ordered, ordered[1:])
+                     if self._storage_start(
+                         a['start'], max(a['end'], b['end']), info, cell)
+                     == a['start']]
+            if not pairs:
+                return False
+            a, b = min(pairs,
+                       key=lambda pair: pair[1]['start'] - pair[0]['end'])
+            a['end'] = max(a['end'], b['end'])
+            a['closed_at'] = max(a['closed_at'], b['closed_at'])
+            a['done'] = min(a['done'], b['done'])
+            a['pos'] = 0
+            a['cell'] = cell
+            a['counts'] = [0] * _hole_ncells(a)
+            a['probe'] = (min(a['probe'], b['probe'])
+                          if a.get('probe') and b.get('probe') else None)
+            for key in _HOLE_PASS_KEYS + ('_errors',):
+                a.pop(key, None)
+            own[:] = [h for h in own if h is not b]
+            self._drop_hole(b)
+        return True
+
+    def _cap_all_holes(self, sensors, cell, now):
+        """Merge the closest holes of the sensors with the most holes until
+        there are at most RECHECK_HOLES_MAX in all (see
+        _merge_closest_holes: nothing is dropped)."""
+        while len(self._recheck_holes) > RECHECK_HOLES_MAX:
+            by_sid = {}
+            for h in self._recheck_holes:
+                by_sid.setdefault(h['sid'], []).append(h)
+            for sid, own in sorted(by_sid.items(), key=lambda kv: -len(kv[1])):
+                if self._merge_closest_holes(own, sensors.get(sid) or {},
+                                             cell, len(own) - 1):
+                    break
+            else:
+                break       # no pair fits in on-board storage: keep them all
+        last = self._recheck_total_warned
+        if last is None or now - last >= 86400:
+            self._recheck_total_warned = now
+            logger.warning(
+                "More than %d gaps to re-check in all; the closest gaps of "
+                "the sensors with the most are merged (reported once a day)",
+                RECHECK_HOLES_MAX)
+
+    def _drop_hole(self, hole):
+        """Forget a hole (by identity: two holes can be equal)."""
+        self._recheck_holes = [h for h in self._recheck_holes if h is not hole]
+
+    def _recheck_active_ids(self, sensors):
+        """The sensors re-reads are for: current ones, within --sensorlist."""
+        ids = {str(s) for s in sensors}
+        if self.args.sensorlist:
+            ids &= {str(s) for s in self.args.sensorlist}
+        return ids
+
+    def _recheck_cap(self, now):
+        """Cells starting before this are not read (MAX_BACKFILL); or None."""
+        max_backfill_str = self.config['daemon']['max_backfill']
+        if max_backfill_str and max_backfill_str != '0':
+            return now - parse_backlog(max_backfill_str) * 60
+        return None
+
+    def _next_cell(self, hole, cap):
+        """The hole's next cell to read from pos on, skipping cells older
+        than MAX_BACKFILL (they count as read); None if none is left."""
+        n = _hole_ncells(hole)
+        k = hole['pos']
+        while k < n and cap is not None and _hole_cell(hole, k)[0] < cap:
+            k += 1
+        return k if k < n else None
+
+    def _early_allowance(self, k):
+        """How long before offset k a hole may ride along in another's call."""
+        offs = self._recheck_offsets
+        if k >= len(offs) - 1:
+            # The last read keeps the horizon: at most 30 min early.
+            return min(RECHECK_EARLY_LAST_MAX, RECHECK_EARLY_SHARE * offs[-1])
+        return RECHECK_EARLY_SHARE * offs[k]
+
+    @staticmethod
+    def _window_str(ts):
+        """An epoch as a query bound, in local time like every other window."""
+        mytz = datetime.timezone(datetime.timedelta(hours=local_time_offset()))
+        return datetime.date.strftime(
+            datetime.datetime.fromtimestamp(ts, tz=mytz), '%Y-%m-%dT%X%z')
+
+    def _recheck_gaps(self, sensors, measurement_name):
+        """Re-read the recorded holes that are due, within the cycle budget.
+
+        Each hole is read again RECHECK_GAPS after it closed - one pass per
+        offset, cell by cell - and whatever the cloud holds by then is
+        written.  The anchor of a call is the most overdue hole; the call
+        reads its next cell plus RECHECK_CALL_PAD either side and serves
+        every due hole, of any sensor, whose next cell fits in that window,
+        plus holes that are almost due.  After an outage of the whole
+        collector one call therefore covers every sensor.
+
+        At most RECHECK_CALLS_PER_CYCLE calls and RECHECK_SECONDS_PER_CYCLE
+        per cycle, so a long pass takes many ordinary cycles instead of
+        stalling one.  Re-reads wait while a backend fails its writes.  A
+        failed call advances nothing.  A cell that failed twice in a row is
+        read alone - one sensor, one cell - so it cannot fail the others'
+        calls (see _recheck_pick); it is skipped for the pass after
+        RECHECK_CELL_MAX_FAILS failed calls, or kept on the last pass (see
+        _cell_failed_out).  Calls of cells read together and calls of cells
+        read alone each have an exponential back-off, and a failed call
+        pauses only its own kind - the common back-off pauses all re-reads -
+        so the cells read alone, however many, make at most one failed call
+        per step.  Apart from the first read alone of a batch that failed
+        twice, they hold up no cell read together; among themselves, the
+        cells whose read is their cell's last take every other call, unless
+        a backend refused their records, and the others go one gap at a
+        time (see _recheck_pick).  A truncated answer halves the cells of
+        the holes it served; one that is truncated even in the smallest
+        cells counts as a failed call.  So does an answer that a backend
+        did not take; only _recheck_pick tells the two apart.
+        """
+        if (self._recheck_next_at is not None
+                and time.monotonic() < self._recheck_next_at):
+            return
+        now = time.time()
+        offs = self._recheck_offsets
+        active = self._recheck_active_ids(sensors)
+        cap = self._recheck_cap(now)
+        for hole in list(self._recheck_holes):
+            try:
+                if hole['done'] >= len(offs):
+                    # E.g. after the schedule was shortened.
+                    self._finish_hole(hole, sensors, now)
+                elif (hole['sid'] not in active
+                        and now > hole['closed_at'] + offs[-1] + 86400):
+                    logger.info("Dropping the gap of sensor %s (%s): the "
+                                "sensor is no longer polled", hole['sid'],
+                                _fmt_span(hole['start'], hole['end'], now))
+                    self._drop_hole(hole)
+            except Exception as exc:
+                self._hole_error(hole, sensors, now, exc)
+        started = time.monotonic()
+        calls = 0
+        while calls < RECHECK_CALLS_PER_CYCLE and self.running:
+            due, early = self._recheck_candidates(now, active, cap, sensors)
+            pick = self._recheck_pick(due, early, now)
+            if pick is None:
+                break
+            alone, c0, limit, batch, kept = pick
+            # Only when a call is about to be made: a backend that fails
+            # while no gap is due is none of the re-reads' business.  Before
+            # every call, not only the first: a failed read alone may have
+            # been a backend that just stopped taking writes, and the next
+            # call's answer could not be written either.
+            if not self._recheck_writers_ready(
+                    sum(1 for e in due if not e['hole'].get('probe'))):
+                break
+            if calls:
+                if (time.monotonic() - started + self.args.delay
+                        > RECHECK_SECONDS_PER_CYCLE):
+                    break
+                self._interruptible_sleep(self.args.delay)
+                if not self.running:
+                    break
+            calls += 1
+            if kept is not None:
+                # A read alone after the others: the kept kind and the
+                # others take every other one (see _recheck_pick).  Counted
+                # when the call is made, not when it is picked: a pick that
+                # the writers gate or the budget stopped got no call.
+                self._recheck_kept_next = not kept
+            # The window ends RECHECK_CALL_PAD after the last cell it is for,
+            # not after the anchor's full cell length: a short gap's call is
+            # no larger than it needs to be.  Every cell keeps its pads.
+            ws = math.floor(c0 - RECHECK_CALL_PAD)
+            we = math.ceil(min(limit, max(e['d'] for e in batch)
+                               + RECHECK_CALL_PAD))
+            # A copy, taken before the call: the call drops or changes it.
+            failed = dict(self._fail_record(batch[0]) or {}) if alone else {}
+            result = self._recheck_call(batch, ws, we, now, sensors,
+                                        measurement_name, cap)
+            if result == 'ok':
+                # Any call that works, a read alone too, shows that the API
+                # and every backend work: the common streak starts over, so
+                # a later failure pauses one step, not as many as failed
+                # calls long ago.  A call read together that works says
+                # nothing about the cells read alone: their back-off stays.
+                self._recheck_fail_streak = 0
+                if alone:
+                    self._recheck_alone_streak = 0
+                    self._recheck_alone_next_at = None
+                    self._read_alone_decides(batch[0], failed, due + early,
+                                             True)
+                continue
+            if (result == 'truncated'
+                    and self._recheck_truncated(batch, ws, we)):
+                # Not a failure of the API or a backend: the holes are read
+                # again in smaller cells at once, without a back-off.
+                continue
+            # A failed call, an answer a backend did not take, or one
+            # truncated even in the smallest cells: retrying at once would
+            # only fail again.  All of them count alike; the cells only
+            # note whether a backend refused the records (see
+            # _recheck_pick).
+            self._recheck_failed(batch, ws, we, now, sensors, cap, alone,
+                                 result == 'unwritten')
+            if alone:
+                # Says nothing about the cells read together: they go on.
+                self._read_alone_decides(batch[0], failed, due + early, False)
+                self._recheck_alone_streak += 1
+                pause = self._recheck_pause(self._recheck_alone_streak)
+                self._recheck_alone_next_at = time.monotonic() + pause
+                logger.debug("Gap re-reads of cells read alone pause for "
+                             "%.0f min after %d failed call(s) in a row",
+                             pause / 60, self._recheck_alone_streak)
+                continue
+            self._recheck_fail_streak += 1
+            pause = self._recheck_pause(self._recheck_fail_streak)
+            self._recheck_next_at = time.monotonic() + pause
+            logger.warning("Gap re-reads pause for %.0f min after %d "
+                           "failed call(s) in a row", pause / 60,
+                           self._recheck_fail_streak)
+            break
+
+    def _recheck_pause(self, streak):
+        """Back-off after ``streak`` failed calls in a row, in seconds:
+        INTERVAL x (2^streak - 1), at most RECHECK_BACKOFF_MAX."""
+        interval = self.args.interval or self.config['daemon']['interval']
+        return min(interval * (2 ** min(streak, 16) - 1), RECHECK_BACKOFF_MAX)
+
+    @staticmethod
+    def _new_fail(k, carry=False):
+        """A failure record for cell k, held in hole['_fail']:
+
+        n        failed calls in a row, as far as skipping goes
+        calls    failed calls made for the cell in this pass, for the logs
+                 (a regroup sets n back, not this)
+        at       the window (ws, we) of the call that failed last; None for
+                 a carry, which has not failed yet
+        refused  the call that failed last got its answer, but a backend
+                 did not take the records (see _recheck_pick)
+        tried    when the cell was last read alone (monotonic), or None:
+                 a carry counts as never read alone (see _alone_order)
+        turn     its read alone comes in turn, with the cells read together:
+                 only a window that failed twice, until a read alone of that
+                 window failed (see _read_alone_decides)
+        regroup  it may still go back to one failure (_read_alone_decides),
+                 once per cell and pass
+
+        A carry starts one failed call short of being skipped
+        (RECHECK_CELL_MAX_FAILS - 1), with no call made yet, and is never in
+        turn or regrouped.
+        """
+        return {'k': k, 'n': RECHECK_CELL_MAX_FAILS - 1 if carry else 0,
+                'calls': 0, 'at': None, 'refused': False, 'tried': None,
+                'turn': not carry, 'regroup': not carry}
+
+    @staticmethod
+    def _fail_record(e):
+        """The failure record of the cell a candidate is about to read
+        (see _new_fail), or None if that cell has not failed."""
+        fail = e['hole'].get('_fail')
+        return fail if fail and fail['k'] == e['k'] else None
+
+    @classmethod
+    def _cell_fails(cls, e):
+        """Failed calls in a row for the cell a candidate is about to read."""
+        fail = cls._fail_record(e)
+        return fail['n'] if fail else 0
+
+    def _recheck_pick(self, due, early, now):
+        """The next call: (alone, c0, limit, batch, kept), or None.
+
+        In turn, most overdue first (due time, then the hole's start): the
+        cells read together, and the first read alone of a window whose
+        calls failed twice in a row - it decides for the window's other
+        cells (_read_alone_decides).  A cell that failed once comes before
+        the others: it is the retry of the call that failed, so its batch
+        stays together, also after a regroup.  The other cells read alone
+        come after all of them: they are likely to fail again, and must
+        hold up no cell read together.  Nothing is read alone while the
+        alone back-off runs.
+
+        Those after the others are of two kinds (_kept_kind).  A cell of
+        the kept kind is its cell's last read: the tries of its grace day go
+        by while it waits, and after the grace end one failed call gives it
+        up.  The others get their calls later.  That costs nothing while
+        the cloud and the bucket still hold their history, except for a
+        cell whose read is its cell's last but whose last failed call a
+        backend refused: it waits with the others, the tries of its grace
+        day go by too, and after the grace end one failed call gives it up.
+        With a bucket retention, history can age out meanwhile.  When both
+        kinds are due they take every other call, and a kind that is due
+        alone takes every call; ``kept`` tells the caller, which keeps the
+        alternation, which kind the call is for (None: neither).  Within
+        each kind, _alone_order.  For the others that means one gap at a
+        time: a carry counts as never read alone, so a gap whose cells are
+        being skipped one by one stays ahead of every cell already read
+        alone.  Several gaps that keep failing - e.g. crawls through the
+        cells older than a bucket's retention - therefore crawl one after
+        another, the most overdue first, each one cell per step of the
+        alone back-off (up to an hour), or per two steps while a cell of
+        the kept kind is due.  Taking turns, each would crawl at a fraction
+        of that speed, and all of them could fall behind the retention
+        boundary, which moves an hour per hour.
+        """
+        alone_ok = (self._recheck_alone_next_at is None
+                    or time.monotonic() >= self._recheck_alone_next_at)
+
+        def in_turn(e):
+            fail = self._fail_record(e)
+            if fail is None or fail['n'] < 2:
+                return True
+            return alone_ok and fail['n'] == 2 and fail['turn']
+
+        first = [e for e in due if in_turn(e)]
+        kept = None
+        if first:
+            anchor = min(first, key=lambda e: (
+                self._cell_fails(e) != 1, e['due_at'], e['hole']['start']))
+            if self._cell_fails(anchor) < 2:
+                c0, limit, batch = self._recheck_batch(anchor, due, early)
+                return False, c0, limit, batch, None
+        elif alone_ok and due:
+            # Every cell due here failed twice at least and is not in turn.
+            kinds = [(self._kept_kind(e, now), e) for e in due]
+            kept_cells = [e for of_kept, e in kinds if of_kept]
+            others = [e for of_kept, e in kinds if not of_kept]
+            kept = bool(kept_cells) and (self._recheck_kept_next
+                                         or not others)
+            anchor = min(kept_cells if kept else others,
+                         key=lambda e: self._alone_order(e, now))
+        else:
+            return None
+        c = anchor['c']
+        return (True, c, c + anchor['hole']['cell'] * 60 + RECHECK_CALL_PAD,
+                [anchor], kept)
+
+    def _kept_kind(self, e, now):
+        """True if a cell read alone after the others is of the kept kind
+        (see _recheck_pick): its read is its cell's last, and a backend did
+        not refuse its last failed call.
+
+        The cell's last read: a kept cell (RECHECK_CELL_MAX_FAILS failed
+        calls on a last pass), or a twice-failed window no longer in turn
+        (its window's read alone or its regroup failed, see
+        _read_alone_decides) on the hole's last pass - 'at' is set: not a
+        carry, which has not failed yet.  A carry on the last pass follows
+        a cell given up after the grace end, so its single call comes after
+        it wherever it sorts.
+
+        A cell whose records a backend refused - most often points older
+        than a bucket's retention, a 422 - cannot be written while it does:
+        with a bucket of 7 days or less, every 7d read that finds samples
+        the earlier reads did not is such a cell.  Its tries would be
+        futile, and would halve the speed of every crawl through such cells
+        while history ages out of the bucket.  So it waits with the others,
+        and still gets its calls there; a later failed call that was not
+        refused (the API failed) gives it its turn back.
+        """
+        fail = self._fail_record(e)
+        if fail['refused']:
+            return False
+        return (fail['n'] >= RECHECK_CELL_MAX_FAILS
+                or (fail['at'] is not None
+                    and self._last_pass(e['hole'], now)))
+
+    def _alone_order(self, e, now):
+        """Sort key of the cells read alone after the others, within each
+        kind (see _recheck_pick): never read alone first, then the least
+        recently read alone, so that each gets its turn; ties by due time,
+        then the hole's start.  A kept cell was always read alone (its
+        third failed call was), so kept cells take turns, after a window
+        demoted on its last pass, which never was.  A carry counts as never
+        read alone, so the gap whose cells are being skipped goes on with
+        its next cell, ahead of every cell read alone before.
+
+        Past its grace end a kept cell among the others (its last failed
+        call was refused, see _kept_kind) counts as never read alone too,
+        if its hole has a next cell: its next failed call gives it up, and
+        its hole goes on from there, like a carry.  It stands where its
+        carry would stand had it been given up at the grace end without a
+        call.  Sorted with the cells read alone, it could wait behind the
+        crawls of less overdue gaps while its own gap's history aged out of
+        the bucket.  A hole's last cell has no carry to stand for: its call
+        only gives it up, and waits like any cell read alone.  A kept cell
+        of the kept kind keeps its turn: put ahead of the kept cells still
+        in their grace day, its single call would come at once, perhaps
+        while the calls still fail, and give it up, and the others would
+        lose turns of their grace day."""
+        fail = self._fail_record(e)
+        tried = fail['tried'] if fail else None
+        if (tried is not None and fail['n'] >= RECHECK_CELL_MAX_FAILS
+                and fail['refused']
+                and now > self._grace_end(e['hole'])
+                and e['k'] < _hole_ncells(e['hole']) - 1):
+            tried = None
+        return (tried is not None, tried or 0.0, e['due_at'],
+                e['hole']['start'])
+
+    def _recheck_batch(self, anchor, due, early):
+        """(c0, limit, batch): the call window [c0 - pad, limit] and its holes.
+
+        The window begins at the earliest next cell that starts at most
+        RECHECK_CALL_PAD before the anchor's, so holes whose cells start a
+        little earlier - sensors of one outage come back minutes apart -
+        share the call.  It is as long as the anchor's cell plus the pads,
+        and the anchor still fits.  Only cells read together join: one read
+        alone could fail the others' call.  After one failed call - most
+        are transient: a 5xx, a 429, a reset - the batch stays together:
+        reading each hole alone would cost one call per sensor for the rest
+        of the pass.
+        """
+        length = anchor['hole']['cell'] * 60
+        c = anchor['c']
+        pool = [e for e in due + early if self._cell_fails(e) < 2]
+        c0 = min(e['c'] for e in pool
+                 if c - RECHECK_CALL_PAD <= e['c'] <= c
+                 and e['d'] - e['c'] <= length)
+        limit = c0 + length + RECHECK_CALL_PAD
+        return c0, limit, [e for e in pool
+                           if e['c'] >= c0 and e['d'] <= limit]
+
+    def _recheck_candidates(self, now, active, cap, sensors):
+        """The holes a call could serve now: (due, early), with next cells.
+
+        A hole is due once its next offset has passed, or while a pass is in
+        progress.  It is early - allowed into a call that a due hole
+        triggered - within _early_allowance() before its offset.  A due
+        hole whose remaining cells are all older than MAX_BACKFILL finishes
+        its pass here, without a call.
+        """
+        offs = self._recheck_offsets
+        due, early = [], []
+        for hole in list(self._recheck_holes):
+            try:
+                if hole['sid'] not in active or hole['done'] >= len(offs):
+                    continue
+                due_at = hole['closed_at'] + offs[hole['done']]
+                is_due = hole['pos'] > 0 or now >= due_at
+                k = self._next_cell(hole, cap)
+                if k is None:
+                    if is_due:
+                        self._finish_pass(hole, now, sensors, skipped=True)
+                    continue
+                if not is_due and (hole['pos'] > 0 or now < due_at
+                                   - self._early_allowance(hole['done'])):
+                    continue
+                c, d = _hole_cell(hole, k)
+                entry = {'hole': hole, 'k': k, 'c': c, 'd': d,
+                         'due_at': due_at}
+                (due if is_due else early).append(entry)
+            except Exception as exc:
+                self._hole_error(hole, sensors, now, exc)
+        return due, early
+
+    def _window_text(self, ws, we):
+        """'<start> -> <stop>' of a re-read window, for logs (never raises)."""
+        try:
+            return f'{self._window_str(ws)} -> {self._window_str(we)}'
+        except (OverflowError, OSError, ValueError, TypeError):
+            return f'{ws!r} -> {we!r}'
+
+    def _writers_healthy(self):
+        """True if every backend is connected and took its last write."""
+        return all(w.connected and w._consecutive_failures == 0
+                   for w in self.writers)
+
+    def _recheck_writers_ready(self, waiting):
+        """True if re-reads may write now; logs when they begin to wait.
+
+        Re-read samples are older than the newest point a backend holds, so
+        a backend that misses them never catches up on them.  Re-reads
+        therefore wait - the gaps keep in state.json - while any backend is
+        disconnected or failed its last write, the same test the deep scan
+        applies.  It also keeps a failing backend's timeouts out of the
+        re-reads' time budget.  Dry runs write nothing and never wait.
+        Asked before each call, so never while no call is due, and again
+        after a call whose write a backend refused; ``waiting`` is how many
+        gaps are due.  Reads of what the polls may have missed are no gaps:
+        while only they wait, both lines are DEBUG (with polls 40-59 min
+        apart they are due most cycles).  The lines say what each backend
+        did: it cannot be told whether a backend that failed its last write
+        is down or refused only that call's records (a 422 for points
+        beyond a bucket's retention), and the reader should not be told it
+        is down when it took every other write.
+        """
+        if self.args.dryrun:
+            return True
+        failing = ['%s %s' % (type(w).__name__, 'is not connected'
+                              if not w.connected else 'failed its last write')
+                   for w in self.writers
+                   if not w.connected or w._consecutive_failures > 0]
+        if failing:
+            if waiting and self._recheck_writers_waiting != 'warned':
+                self._recheck_writers_waiting = 'warned'
+                logger.warning("%d gap re-read(s) wait: %s; the gaps are kept "
+                               "and re-read after a write works", waiting,
+                               ', '.join(failing))
+            elif not self._recheck_writers_waiting:
+                self._recheck_writers_waiting = 'quiet'
+                logger.debug("Re-reads wait: %s", ', '.join(failing))
+            return False
+        if self._recheck_writers_waiting:
+            (logger.info if self._recheck_writers_waiting == 'warned'
+             else logger.debug)("Every backend takes writes again; gap "
+                                "re-reads resume")
+            self._recheck_writers_waiting = False
+        return True
+
+    def _recheck_call(self, batch, ws, we, now, sensors, measurement_name,
+                      cap):
+        """One re-read call for a batch of holes: 'ok', 'truncated', 'failed'
+        or 'unwritten'.
+
+        A hole contributes records - its whole cell, margins included - only
+        when its interior now holds more settled samples than any read
+        found before; a probe on its single read always does.  Nothing
+        advances unless the answer was complete and every record it
+        produced reached every backend.  'failed': the call itself failed.
+        'unwritten': the answer came in full, but a backend did not take
+        its records (or the daemon is stopping).  The caller counts both
+        alike; only _recheck_pick tells them apart.
+
+        A probe is no gap, and with polls 40-59 min apart there is one per
+        sensor nearly every poll: the probes of a call get one summary line
+        instead of the gap lines, at INFO only if they found samples.
+        """
+        sids = sorted({e['hole']['sid'] for e in batch})
+        gaps = [e for e in batch if not e['hole'].get('probe')]
+        try:
+            ws_str, we_str = self._window_str(ws), self._window_str(we)
+            if gaps:
+                logger.info("Re-reading %d gap(s) of %d sensor(s): %s -> %s",
+                            len(gaps), len({e['hole']['sid'] for e in gaps}),
+                            ws_str, we_str)
+            else:
+                logger.debug("Reading again what the polls may have missed "
+                             "for %d sensor(s): %s -> %s", len(sids), ws_str,
+                             we_str)
+            self._touch()
+            resp = self.api.get_samples(ws_str, we_str, measures=MEASURES,
+                                        limit=(self.args.qlimit or 10000),
+                                        sensors=sids)
+            truncated = bool(resp.get('truncated'))
+            data = resp.get('sensors') or {}
+        except Exception as e:
+            logger.warning("Gap re-read %s failed: %s",
+                           self._window_text(ws, we), e)
+            return 'failed'
+        if truncated:
+            return 'truncated'
+        settled = now - RECHECK_SETTLED_AGE
+        times = {}     # sid -> [(observed epoch, index in the answer)]
+        taken = {}     # sid -> indices already contributed by this call
+        records = []
+        results = []
+        for e in batch:
+            hole = e['hole']
+            before = len(records)
+            try:
+                sid = hole['sid']
+                if sid not in times:
+                    times[sid] = [(_observed_epoch(item.get('observed')), i)
+                                  for i, item in enumerate(data.get(sid) or [])]
+                last = e['k'] == _hole_ncells(hole) - 1
+                cell = [(t, i) for t, i in times[sid]
+                        if t is not None and e['c'] <= t
+                        and (t < e['d'] or (last and t == e['d']))]
+                interior = sorted({t for t, _ in cell
+                                   if hole['start'] < t < hole['end']
+                                   and t <= settled})
+                n = len(interior)
+                # A probe's margins can hold an own sample the window left
+                # out even when its interior is empty: its one read writes.
+                if n > hole['counts'][e['k']] or (hole.get('probe')
+                                                  and hole['done'] == 0):
+                    seen = taken.setdefault(sid, set())
+                    new = sorted(i for _, i in cell if i not in seen)
+                    if new:
+                        records.extend(process_samples(
+                            {'sensors': {sid: [data[sid][i] for i in new]}},
+                            sensors, measurement_name,
+                            self.config['my_altitude'], self.args.noconvert))
+                        seen.update(new)
+                hole.pop('_errors', None)
+                results.append((e, n, interior, len(records) - before))
+            except Exception as exc:
+                self._hole_error(hole, sensors, now, exc)
+        for i in range(0, len(records), RECHECK_WRITE_SLICE):
+            part = records[i:i + RECHECK_WRITE_SLICE]
+            if self.args.dryrun:
+                self._log_dryrun(part)
+            elif (not self._safe_write(part) or not self.running
+                  or not self._writers_healthy()):
+                # Also when only some backends took it: the others would
+                # never get these samples otherwise.
+                logger.warning("Writing gap re-reads failed on at least one "
+                               "backend; they are read again later")
+                return 'unwritten'
+        probes = [(e, n, wrote) for e, n, _, wrote in results
+                  if e['hole'].get('probe')]
+        if probes:
+            # Before the holes advance: their counts are still the old ones.
+            new = sum(max(0, n - e['hole']['counts'][e['k']])
+                      for e, n, _ in probes)
+            (logger.info if new else logger.debug)(
+                "Read again what the polls may have missed for %d sensor(s) "
+                "(%s): %d new samples, %s",
+                len({e['hole']['sid'] for e, _, _ in probes}),
+                self._window_text(ws, we), new,
+                'not written (dry run)' if self.args.dryrun
+                else '%d written' % sum(wrote for _, _, wrote in probes))
+        for e, n, interior, _ in results:
+            try:
+                self._advance_hole(e, n, interior, now, sensors, cap)
+            except Exception as exc:
+                self._hole_error(e['hole'], sensors, now, exc)
+        return 'ok'
+
+    def _recheck_truncated(self, batch, ws, we):
+        """A re-read answer was truncated: read its holes in smaller cells.
+
+        Halves the cells of the holes in the batch and returns True.  Their
+        pass starts over with counts from zero, so the next reads write
+        everything again and nothing is lost.  If every hole already has
+        cells of RECHECK_CELL_MIN, a sensor has more samples in such a
+        window than -q/--qlimit allows: returns False, and the caller counts
+        the call as failed (the cell is tried again after the back-off - the
+        live copies of the newest half hour may have gone by then - and
+        skipped like any other failing cell).  The -q advice is logged once
+        per pass of a hole.
+        """
+        qlimit = self.args.qlimit or 10000
+        shrunk = [e for e in batch if e['hole']['cell'] > RECHECK_CELL_MIN]
+        for e in shrunk:
+            hole = e['hole']
+            hole['cell'] = max(RECHECK_CELL_MIN, hole['cell'] // 2)
+            hole['counts'] = [0] * _hole_ncells(hole)
+            hole['pos'] = 0
+            for key in _HOLE_PASS_KEYS:
+                hole.pop(key, None)
+        if shrunk:
+            logger.warning("Gap re-read %s was truncated: a sensor has more "
+                           "than %d samples (-q/--qlimit) in it; reading %d "
+                           "gap(s) in %d-min cells instead",
+                           self._window_text(ws, we), qlimit, len(shrunk),
+                           min(e['hole']['cell'] for e in shrunk))
+            return True
+        new = [e for e in batch if not e['hole'].get('_qwarned')]
+        (logger.warning if new else logger.debug)(
+            "Gap re-read %s is truncated even in %d-min cells: a sensor has "
+            "more than %d samples (-q/--qlimit) in it; a larger -q/--qlimit "
+            "(0 means 10000) avoids it", self._window_text(ws, we),
+            RECHECK_CELL_MIN, qlimit)
+        for e in batch:
+            e['hole']['_qwarned'] = True
+        return False
+
+    def _recheck_failed(self, batch, ws, we, now, sensors, cap, alone,
+                        refused):
+        """A re-read call failed: count it against each cell it was for.
+
+        Records the call's window (see _read_alone_decides), whether a
+        backend refused its records (``refused``, see _kept_kind) and, for
+        a call read alone, when it was tried (see _alone_order).  A cell
+        that reached RECHECK_CELL_MAX_FAILS failed calls in a row is then
+        skipped, kept or given up by _cell_failed_out().
+        """
+        for e in batch:
+            hole = e['hole']
+            fail = self._fail_record(e)
+            if fail is None:
+                fail = hole['_fail'] = self._new_fail(e['k'])
+            fail['n'] += 1
+            fail['calls'] += 1
+            fail['at'] = (ws, we)
+            fail['refused'] = refused
+            if alone:
+                fail['tried'] = time.monotonic()
+            if fail['n'] >= RECHECK_CELL_MAX_FAILS:
+                self._cell_failed_out(hole, e['k'], fail, now, sensors, cap)
+
+    def _cell_failed_out(self, hole, k, fail, now, sensors, cap):
+        """Cell k failed RECHECK_CELL_MAX_FAILS calls in a row, or more.
+
+        Not on the last pass, it is skipped for this pass, with a WARNING;
+        its count stays, so the next pass reads it again.  A window the API
+        or a backend always refuses then costs a few calls per pass and
+        never stops the other re-reads.  The last pass has no next one: its
+        cell is kept, and tried again alone in its turn.  Only a call that
+        fails after the hole's grace end gives it up - never the clock
+        alone: its last try may lie far back (the turns of other kept
+        cells, a spell of failing polls), and it may work now.  A skipped
+        or given-up cell's hole goes on with its next cell, as a carry
+        (_skip_cell).  The WARNINGs give the failed calls actually made for
+        the cell.
+        """
+        name = (sensors.get(hole['sid']) or {}).get('name', hole['sid'])
+        text = self._window_text(*fail['at'])
+        if not self._last_pass(hole, now):
+            logger.warning("Re-reading %s for the gap in '%s' %s; skipped "
+                           "for this pass, the next one reads it again",
+                           text, name, _fmt_failed(fail['calls']))
+        elif now <= self._grace_end(hole):
+            if fail['n'] == RECHECK_CELL_MAX_FAILS:
+                logger.warning(
+                    "Re-reading %s for the gap in '%s' %s; this is its last "
+                    "re-read, so it is tried again until it works or a call "
+                    "after %s fails", text, name, _fmt_failed(fail['calls']),
+                    _fmt_time(self._grace_end(hole)))
+            return
+        else:
+            logger.warning("Re-reading %s for the gap in '%s' %s; its last "
+                           "re-read is given up", text, name,
+                           _fmt_failed(fail['calls']))
+        self._skip_cell(hole, k, now, sensors, cap)
+
+    def _grace_end(self, hole):
+        """After this, a failed call gives up a kept cell of the hole's
+        last pass (see _cell_failed_out)."""
+        return (hole['closed_at'] + self._recheck_offsets[-1]
+                + RECHECK_LAST_PASS_GRACE)
+
+    def _skip_cell(self, hole, k, now, sensors, cap):
+        """Leave cell k unread for this pass; its count stays as it was.
+
+        Only for a cell whose calls kept failing: the hole's next cell is
+        likely to fail as well, so it becomes a carry, one failed call short
+        of being skipped - read alone, after the cells read together, which
+        it can neither fail nor hold up.  A successful read clears that.
+        The carry counts as never read alone (see _alone_order), so it
+        comes before every cell already read alone: a gap that crawls
+        through a run of failing cells, such as those older than a bucket's
+        retention, goes on towards the cells that can be written, one cell
+        per step of the alone back-off (one per two steps while a cell of
+        the kept kind is due, see _recheck_pick), unless a more overdue
+        gap's crawl is under way.
+        """
+        hole.setdefault('_since', now)
+        hole.pop('_fail', None)
+        hole.pop('_chain', None)
+        hole['_partial'] = True
+        hole['pos'] = k + 1
+        nxt = self._next_cell(hole, cap)
+        if nxt is not None:
+            hole['pos'] = nxt
+            hole['_fail'] = self._new_fail(nxt, carry=True)
+        else:
+            self._finish_pass(hole, now, sensors)
+
+    def _read_alone_decides(self, read, failed, entries, worked):
+        """A cell was read alone; decide for the others of its window.
+
+        ``read`` is the candidate read alone, ``failed`` a copy of its
+        failure record before the call, ``entries`` the candidates of the
+        call.  Only a window that failed twice decides (not a carry or a
+        kept cell); its other cells are those whose last failed call was
+        the same window.
+        - The read worked: most calls that fail, fail for all of their
+          cells (a 5xx, a 429, a reset).  They go back to one failure, and
+          _recheck_pick() puts them first, so the next call reads them
+          together at that window: every hole of the failed batch moves on
+          in step, and the hole read alone does not run ahead and split it.
+          Once per cell and pass: if that call fails too, they are read
+          alone.
+        - It failed: the window is likely to fail for them too (a backend's
+          retention, a window the API refuses).  They are read alone after
+          the cells read together, so they hold up no cell read together:
+          with the kept cells if the hole is on its last pass and no backend
+          refused their records, else with the carries (see _kept_kind).
+        """
+        if failed.get('n') != 2 or failed.get('at') is None:
+            return
+        for e in entries:
+            fail = self._fail_record(e)
+            if (e['hole'] is read['hole'] or fail is None or fail['n'] != 2
+                    or fail['at'] != failed['at']):
+                continue
+            if not worked:
+                fail['turn'] = False
+            elif failed['regroup'] and fail['regroup']:
+                fail.update(n=1, turn=False, regroup=False)
+
+    def _hole_error(self, hole, sensors, now, exc):
+        """A hole could not be re-read (called from an except block)."""
+        errors = hole.get('_errors', 0) + 1
+        hole['_errors'] = errors
+        name = (sensors.get(hole['sid']) or {}).get('name', hole['sid'])
+        span = _fmt_span(hole['start'], hole['end'], now)
+        if errors >= RECHECK_HOLE_MAX_ERRORS:
+            logger.error("Dropping the gap in '%s' (%s) after %d failed "
+                         "re-reads in a row", name, span, errors,
+                         exc_info=True)
+            self._drop_hole(hole)
+        else:
+            logger.warning("Could not re-read the gap in '%s' (%s): %s",
+                           name, span, exc)
+            logger.debug("Gap re-read error", exc_info=True)
+
+    def _advance_hole(self, e, n, interior, now, sensors, cap):
+        """Book a successful read of one cell; after the last, end the pass.
+
+        Also follows the settled interior samples from cell to cell, so a
+        pass that read every cell in order can show the hole is complete.
+        """
+        hole, k = e['hole'], e['k']
+        hole.setdefault('_since', now)
+        before = hole['counts'][k]
+        hole['counts'][k] = max(before, n)
+        hole['_found'] = hole.get('_found', 0) + n
+        hole['_new'] = hole.get('_new', 0) + max(0, n - before)
+        hole.pop('_fail', None)
+        chain = ({'k': 0, 'first': None, 'last': None, 'inner': 0.0}
+                 if k == 0 else hole.get('_chain'))
+        if chain is not None and chain['k'] == k:
+            for t in interior:
+                if chain['last'] is None:
+                    chain['first'] = t - hole['start']
+                else:
+                    chain['inner'] = max(chain['inner'], t - chain['last'])
+                chain['last'] = t
+            chain['k'] = k + 1
+            hole['_chain'] = chain
+        else:
+            # A cell was left out (or the daemon restarted mid-pass).
+            hole.pop('_chain', None)
+        ncells = _hole_ncells(hole)
+        logger.debug("Re-read cell %d/%d of the gap in sensor %s: %d "
+                     "sample(s), %d before", k + 1, ncells, hole['sid'], n,
+                     before)
+        hole['pos'] = k + 1
+        nxt = self._next_cell(hole, cap)
+        if nxt is not None:
+            hole['pos'] = nxt
+            return
+        chain = hole.pop('_chain', None)
+        self._finish_pass(hole, now, sensors,
+                          chain=chain if chain and chain['k'] == ncells
+                          else None)
+
+    def _last_pass(self, hole, now):
+        """True if no re-read pass follows the hole's current one.
+
+        That is the last offset's pass, and a pass that began - its first
+        cell read or skipped ('_since') - at or after the last offset: the
+        offsets after it went by while no re-read could run, and collapse
+        into it.  A pass that has not begun counts as beginning now.  A pass
+        that began before the last offset is not the last, even if it ends
+        after it: the cells it read or skipped before re-reads stopped (the
+        Pi off, a backend failing) get one more read.
+        """
+        offs = self._recheck_offsets
+        return (hole['done'] >= len(offs) - 1
+                or hole.get('_since', now) >= hole['closed_at'] + offs[-1])
+
+    def _finish_pass(self, hole, now, sensors, chain=None, skipped=False):
+        """A re-read pass over a hole is complete: schedule the next one.
+
+        Offsets that went by while no re-read could run - the daemon was
+        down, the polls or a backend failed - collapse into this pass, but
+        the last one only if this was the last pass (see _last_pass): else
+        the last offset's pass still follows, and reads every cell again.
+        ``chain`` is set when the pass read every cell in order.  A hole of
+        a sensor that records every minute is then dropped as soon as its
+        interior is complete, and a probe as soon as it shows no gap; a long
+        hole whose first pass found nothing skips ahead to the first offset
+        of at least 3 days, if the schedule has one.
+        """
+        offs = self._recheck_offsets
+        info = sensors.get(hole['sid']) or {}
+        name = info.get('name', hole['sid'])
+        span = _fmt_span(hole['start'], hole['end'], now)
+        first = hole['done'] == 0
+        partial = hole.get('_partial', False)
+        done = max(hole['done'] + 1,
+                   sum(1 for o in offs if hole['closed_at'] + o <= now))
+        if done >= len(offs) and not self._last_pass(hole, now):
+            done = len(offs) - 1
+        hole['done'] = done
+        hole['pos'] = 0
+        found = hole.get('_found', 0)
+        new = hole.get('_new', 0)
+        for key in _HOLE_PASS_KEYS:
+            hole.pop(key, None)
+        probe = hole.get('probe')
+        if skipped:
+            result = 'older than MAX_BACKFILL, not read'
+        elif probe:
+            # Its one read wrote its whole cell, margins included, whatever
+            # the interior held; the call's summary line says how much.
+            result = '%d samples inside' % found
+        elif new:
+            result = '%d samples, %d new, %s' % (
+                found, new,
+                'not written (dry run)' if self.args.dryrun else 'written')
+        else:
+            result = '%d samples, nothing new' % found
+        if partial:
+            result += '; part of it could not be read'
+        # A probe is no gap: its call has a summary line (_recheck_call).
+        (logger.debug if probe else logger.info)(
+            "Re-read %d/%d of the gap in '%s' (%s): %s",
+            min(hole['done'], len(offs)), len(offs), name, span, result)
+        if (info.get('type') in ONE_PER_MINUTE_TYPES and chain is not None
+                and _interior_complete(hole, chain)):
+            (logger.debug if probe else logger.info)(
+                "Gap in '%s' %s is complete (%d samples); no more re-reads",
+                name, span, found)
+            self._drop_hole(hole)
+            return
+        if probe:
+            if chain is not None and _largest_step(hole, chain) <= probe:
+                logger.debug("No gap in '%s' %s; no more re-reads", name,
+                             span)
+                self._drop_hole(hole)
+                return
+            # A gap after all (or not all of it could be read): from now on
+            # it is read as one.
+            hole['probe'] = None
+            if hole['done'] < len(offs):
+                logger.info(
+                    "Gap in '%s' %s: %s; re-reading it after %s", name, span,
+                    'no data for %s' % _fmt_duration(_largest_step(
+                        hole, chain)) if chain is not None
+                    else 'not all of it could be read',
+                    ', '.join(_fmt_offset(o) for o in offs[hole['done']:]))
+        if (first and not partial and not sum(hole['counts'])
+                and hole['end'] - hole['start'] > RECHECK_EMPTY_LONG):
+            # Only where there is a later read to skip to: a schedule
+            # without an offset of 3 days or more keeps all of its reads.
+            later = [i for i, o in enumerate(offs)
+                     if o >= RECHECK_EMPTY_SKIP_TO]
+            if later and later[0] > hole['done']:
+                hole['done'] = later[0]
+                logger.info("Nothing in the gap in '%s' %s yet; next "
+                            "re-read after %s", name, span,
+                            _fmt_offset(offs[later[0]]))
+        if hole['done'] >= len(offs):
+            self._finish_hole(hole, sensors, now)
+
+    def _finish_hole(self, hole, sensors, now):
+        """All re-reads of a hole are done: drop it, with a summary."""
+        name = (sensors.get(hole['sid']) or {}).get('name', hole['sid'])
+        logger.info("Gap in '%s' %s: re-checks finished; the cloud holds %d "
+                    "samples in it", name,
+                    _fmt_span(hole['start'], hole['end'], now),
+                    sum(hole['counts']))
+        self._drop_hole(hole)
+
     def _backlog_min(self, setting, name):
         """A look-back-from-now window in minutes, at least MIN_POLL_BACKLOG_MIN.
 
@@ -2409,6 +4263,12 @@ class SensorPushDaemon:
                     written = self._safe_write(records)
                     if written:
                         self._mark_success()
+
+                # Gap detection.  Isolated: it can never fail, repeat or
+                # change the window that was just handled.
+                if self._recheck_on:
+                    self._note_fetched_safely(samples, sensors, window,
+                                              sensor_filter)
 
                 # Delay between iterations
                 if iterations > 1 and iteration < iterations:
