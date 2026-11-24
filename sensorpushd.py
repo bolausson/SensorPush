@@ -196,7 +196,21 @@ MIN_POLL_BACKLOG_MIN = 60
 #       behaves exactly as it did without them.  Daemon mode only.
 #   recheck_min_gap  The shortest silence that counts as a gap.  At least
 #       15m: live copies of one sensor can be almost 13 minutes apart.
-#       The defaults of both are in DEFAULT_RECHECK_CFG.
+#   recheck_give_up_after  The failed calls in a row a gap's last re-read
+#       makes, all its windows together (a read of the gap that works starts
+#       the count over); the one that reaches this many gives up its window,
+#       and each later window of the gap is given up after one more.  The
+#       first window given up still fails RECHECK_CELL_MAX_FAILS (3) times in
+#       a row first, also with a smaller value.  While re-read calls fail,
+#       cells read alone get at most one call per step of the alone back-off
+#       (up to RECHECK_BACKOFF_MAX, an hour), shared by every waiting gap:
+#       with 48, one gap outlasts nearly two days of failing calls (about
+#       43 h at INTERVAL 300), several gaps longer, and a gap that never
+#       works costs at most 48 failed calls plus one per remaining window.
+#       A window whose records a backend keeps refusing is given up sooner:
+#       by a refused call more than RECHECK_LAST_PASS_GRACE (a day) after
+#       the last re-read time.
+#       The defaults of all three are in DEFAULT_RECHECK_CFG.
 DEFAULT_DAEMON_CFG = {
     'interval': 300,
     'poll_backlog': '1h',
@@ -213,6 +227,7 @@ DEFAULT_DAEMON_CFG = {
 DEFAULT_RECHECK_CFG = {
     'recheck_gaps': '1h, 6h, 1d, 3d, 7d',
     'recheck_min_gap': '20m',
+    'recheck_give_up_after': '48',
 }
 
 # -----------------------------------------------------------------------------
@@ -322,11 +337,14 @@ RECHECK_CELL_MIN = 30
 RECHECK_CELL_MAX_FAILS = 3
 # The last pass has no next one: there a cell is not skipped but kept, and
 # tried again alone (kept cells take every other read alone after the
-# others, unless a backend refused their records, see _recheck_pick); only
-# a call that fails more than this long after the last offset gives it up,
-# so the tries of that day can outlast a spell of failed calls.  A pass is
-# also the last when it began after the last offset: the offsets after it
-# collapse into it.
+# others, unless a backend refused their records, see _recheck_pick).  It is
+# given up by the failed call that brings its hole to RECHECK_GIVE_UP_AFTER
+# failed calls in a row (see _tries_left), so the tries can outlast a spell
+# of failing calls - or, if a backend refused its records, by a refused call
+# more than this long after the last offset: those records will most likely
+# be refused again, and the hole's crawl towards cells that can be written
+# waits behind it (see _cell_failed_out).  A pass is also the last when it
+# began after the last offset: the offsets after it collapse into it.
 RECHECK_LAST_PASS_GRACE = 86400
 # Times restored from state.json lie between 2015-01-01 (no SensorPush data
 # is older) and one day ahead of the clock; anything else is damage.
@@ -388,7 +406,7 @@ def _load_legacy_influxdb2(config):
     host_part = url.split('://', 1)[-1]
     if ':' not in host_part:
         url = f'{url}:{port}'
-    return {
+    return _read_cutoff_keys(config, {
         'login': config[section]['LOGIN'],
         'password': config[section]['PASSWD'],
         'backend': 'influxdb2',
@@ -406,13 +424,13 @@ def _load_legacy_influxdb2(config):
         'influxdb3': None,
         'victoriametrics': None,
         'daemon': _read_recheck_keys(config, dict(DEFAULT_DAEMON_CFG)),
-    }
+    })
 
 
 def _load_legacy_vm(config):
     """Load legacy ~/.sensorpush_vm.conf format."""
     section = 'SONSORPUSHAPI' if 'SONSORPUSHAPI' in config else 'SENSORPUSHAPI'
-    return {
+    return _read_cutoff_keys(config, {
         'login': config[section]['LOGIN'],
         'password': config[section]['PASSWD'],
         'backend': 'victoriametrics',
@@ -427,11 +445,12 @@ def _load_legacy_vm(config):
             'sensor_uid': config['VICTORIAMETRICSCONF'].getboolean('SENSOR_UID', fallback=False),
         },
         'daemon': _read_recheck_keys(config, dict(DEFAULT_DAEMON_CFG)),
-    }
+    })
 
 
 def _read_recheck_keys(config, daemon_cfg):
-    """Add RECHECK_GAPS / RECHECK_MIN_GAP from [DAEMON], if the file sets them.
+    """Add RECHECK_GAPS / RECHECK_MIN_GAP / RECHECK_GIVE_UP_AFTER from
+    [DAEMON], if the file sets them.
 
     The only [DAEMON] keys a legacy config file honours, so its users can
     turn the re-checks off too.  Keys the file does not set stay out of the
@@ -444,6 +463,39 @@ def _read_recheck_keys(config, daemon_cfg):
             # daemon mode with a one-line error; one-shot mode ignores it.
             daemon_cfg[key] = config.get('DAEMON', key.upper(), raw=True)
     return daemon_cfg
+
+
+# Section names are case-sensitive: one that is meant as [CUTOFFS] but named
+# otherwise would not be read, and the error values stored.
+_CUTOFFS_SECTION_TYPO = re.compile(r'\s*cut[-_ ]?offs?\s*', re.IGNORECASE)
+
+
+def _read_cutoff_keys(config, cfg):
+    """Add the [CUTOFFS] keys the file sets, raw, as cfg['cutoffs'].
+
+    Read by every loader, legacy ones too.  Without the section, or with an
+    empty one (the template's), the key stays out of the dict and the file
+    loads exactly as before.  The values are checked when the daemon starts
+    (parse_cutoffs), in every mode: each stores records.  Sections named
+    like it that set keys ([cutoffs], [CUTOFF], ...) go into
+    cfg['cutoffs_misnamed'], an error at startup too.
+    """
+    # Raw, as the RECHECK keys; and without the [DEFAULT] keys, which
+    # configparser shows in every section.
+    defaults = config.defaults()
+    if config.has_section('CUTOFFS'):
+        raw = {key.upper(): value
+               for key, value in config.items('CUTOFFS', raw=True)
+               if key not in defaults}
+        if raw:
+            cfg['cutoffs'] = raw
+    misnamed = [name for name in config.sections()
+                if name != 'CUTOFFS' and _CUTOFFS_SECTION_TYPO.fullmatch(name)
+                and any(key not in defaults
+                        for key, _ in config.items(name, raw=True))]
+    if misnamed:
+        cfg['cutoffs_misnamed'] = misnamed
+    return cfg
 
 
 def _load_unified(config):
@@ -522,7 +574,7 @@ def _load_unified(config):
             'sensor_uid': config.getboolean('VICTORIAMETRICS', 'SENSOR_UID', fallback=False),
         }
 
-    return cfg
+    return _read_cutoff_keys(config, cfg)
 
 
 # Written as text rather than through ConfigParser, which would drop the
@@ -592,6 +644,26 @@ SENSOR_STALE_AFTER = 6h
 # RECHECK_GAPS = 1h, 6h, 1d, 3d, 7d
 # The shortest silence of a sensor that counts as a gap.
 # RECHECK_MIN_GAP = 20m
+# A gap's last re-read is given up after this many failed calls in a row, all
+# its windows together (each later window of the gap after one more; the
+# first one given up still fails 3 times in a row first).  While re-read
+# calls fail they come once per pause, which grows to an hour, shared by
+# every waiting gap: 48 take nearly two days for one gap (about 43 h).
+# A window whose records a backend keeps refusing is given up sooner: by a
+# refused call more than a day after the last re-read time.
+# RECHECK_GIVE_UP_AFTER = 48
+
+[CUTOFFS]
+# Sensor error values, not stored: a value at or below its metric's floor, or
+# at or above its ceiling (the cut-off itself counts as an error, so a floor
+# can be a sensor's error value).  Nor are the values computed from it:
+# dewpoint, vpd and abs_humidity from temperature or humidity, abs_humidity
+# and altitude from pressure.  In the units stored: C, %, mBar, g/m3, m, V,
+# dBm (with -n: F, inHg, kPa, ft).  Empty or missing: no cut-off.  A failed
+# HT1 chip reports -46.84 C and 0 %, an HTP.xw -40 C and 0 % (see the README).
+# TEMPERATURE_FLOOR = -40
+# HUMIDITY_FLOOR = 0
+# Also <METRIC>_CEILING, and both for PRESSURE, DISTANCE, DEWPOINT, VPD, ABS_HUMIDITY, ALTITUDE, VOLTAGE, RSSI.
 
 [MISC]
 MY_ALTITUDE = 0.0
@@ -857,6 +929,93 @@ def parse_recheck_min_gap(value):
     return m * 60
 
 
+def parse_recheck_give_up_after(value):
+    """RECHECK_GIVE_UP_AFTER -> a count of at least 1.  Raises ValueError if
+    it is invalid."""
+    try:
+        count = int(str(value).strip())
+    except ValueError:
+        count = None
+    if count is None or count < 1:
+        raise ValueError(
+            f"RECHECK_GIVE_UP_AFTER = {value!r} is not a whole number of at "
+            f"least 1 (the failed calls after which a gap's last re-read is "
+            f"given up)")
+    return count
+
+
+# -----------------------------------------------------------------------------
+# Cut-offs for sensor error values ([CUTOFFS])
+# -----------------------------------------------------------------------------
+# A sensor whose temperature/humidity chip fails keeps reporting fixed error
+# values, which the API serves like any reading: an HT1 the chip's raw 0
+# (-46.85 + 175.72 x 0 = -46.84 C) with 0 % humidity, an HTP.xw -40 C with
+# 0 %.  [CUTOFFS] sets a floor and a ceiling per stored field, named after it
+# in upper case (TEMPERATURE_FLOOR, ...): a value at or below its floor, or at
+# or above its ceiling, is an error value and is not stored (see _cut_records).
+# The fields of the sample records, then those of the status records
+# (MEASUREMENT_NAME + '_V', see build_voltage_records).
+CUTOFF_FIELDS = ('temperature', 'humidity', 'pressure', 'distance',
+                 'dewpoint', 'vpd', 'abs_humidity', 'altitude',
+                 'voltage', 'rssi')
+# Computed from a measured value, by the API or by the daemon: garbage too
+# when that value is an error value.
+CUTOFF_DERIVED = {'temperature': ('dewpoint', 'vpd', 'abs_humidity'),
+                  'humidity': ('dewpoint', 'vpd', 'abs_humidity'),
+                  'pressure': ('abs_humidity', 'altitude')}
+# A record left without any of these is not stored: a sample's altitude
+# alone means nothing, and a status record holds only voltage and rssi.
+CUTOFF_KEEPS = ('temperature', 'humidity', 'pressure', 'distance',
+                'voltage', 'rssi')
+
+
+def _cutoff_key(field, ceiling):
+    """'TEMPERATURE_FLOOR' for ('temperature', False), for logs."""
+    return f"{field.upper()}_{'CEILING' if ceiling else 'FLOOR'}"
+
+
+def parse_cutoffs(raw):
+    """[CUTOFFS] -> {field: (floor, ceiling)}, None for a bound not set.
+
+    ``raw`` maps the keys the section sets, in upper case, to their values.
+    An empty value sets no bound; {} means no cut-off at all.  Raises
+    ValueError with a one-line reason naming the bad keys and listing the
+    valid ones: a value that is not a number, an unknown key (a typo) or a
+    floor at or above the ceiling of the same metric.
+    """
+    valid = {_cutoff_key(f, c): (f, int(c)) for f in CUTOFF_FIELDS
+             for c in (False, True)}
+    problems = []
+    unknown = [key for key in raw if key not in valid]
+    if unknown:
+        problems.append('unknown key%s %s' % ('s' if len(unknown) > 1 else '',
+                                              ', '.join(unknown)))
+    bounds = {}
+    for key, value in raw.items():
+        if key not in valid or not str(value).strip():
+            continue
+        try:
+            number = float(str(value).strip())
+        except ValueError:
+            number = None
+        if number is None or not math.isfinite(number):
+            problems.append(f'{key} = {value!r} is not a number')
+            continue
+        field, which = valid[key]
+        bounds.setdefault(field, [None, None])[which] = number
+    for field in CUTOFF_FIELDS:
+        floor, ceiling = bounds.get(field, (None, None))
+        if floor is not None and ceiling is not None and floor >= ceiling:
+            problems.append(
+                f'{_cutoff_key(field, False)} = {floor:g} is not below '
+                f'{_cutoff_key(field, True)} = {ceiling:g}')
+    if problems:
+        raise ValueError(
+            '; '.join(problems) + '. The valid keys are <METRIC>_FLOOR and '
+            '<METRIC>_CEILING for ' + ', '.join(f.upper() for f in CUTOFF_FIELDS))
+    return {field: tuple(b) for field, b in bounds.items()}
+
+
 # -----------------------------------------------------------------------------
 # Stored sensor ids
 # -----------------------------------------------------------------------------
@@ -923,6 +1082,9 @@ class BaseWriter(ABC):
         self._consecutive_failures = 0
         # Opt-in (SENSOR_UID): also store the full API id as tag sensor_uid.
         self.sensor_uid = False
+        # The newest sample (epoch) whose temperature [CUTOFFS] cut off, of
+        # the batches this backend took; memory only (see _safe_write).
+        self._cut_upto = None
 
     @property
     def connected(self):
@@ -990,6 +1152,9 @@ class InfluxDB2Writer(BaseWriter):
         self.client = None
         self.write_api = None
         self.query_api = None
+        # The first write the bucket stored only in part logs a WARNING, the
+        # later ones INFO (see write()).
+        self._retention_warned = False
 
     def connect(self):
         try:
@@ -1013,9 +1178,112 @@ class InfluxDB2Writer(BaseWriter):
         logger.info("Connected to InfluxDB 2 at %s", self.url)
 
     def write(self, records):
+        """Write the records; a write the bucket stored only in part, as
+        some points are older than it keeps, counts as done.
+
+        InfluxDB 2 answers such a write with HTTP 422, e.g. "failure writing
+        points to database: partial write: points beyond retention policy
+        dropped=12": it stored every point inside the retention and dropped
+        the others, which it will never take.  Failing the write would only
+        repeat it - a failed window retried every cycle, a gap re-read that
+        never gets through.  Every other error, also any other 422 (a field
+        type conflict, say), is raised as before.
+        """
         if not records:
             return
-        self.write_api.write(bucket=self.bucket, org=self.org, record=records)
+        try:
+            self.write_api.write(bucket=self.bucket, org=self.org, record=records)
+        except Exception as e:
+            beyond, dropped = self._beyond_retention(e)
+            if not beyond:
+                raise
+            self._log_retention_drop(records, dropped)
+
+    _DROPPED_RE = re.compile(r'dropped=(\d+)')
+
+    @classmethod
+    def _beyond_retention(cls, exc):
+        """(True, points dropped or None) if exc is InfluxDB 2's answer to a
+        write with points beyond the bucket's retention, else (False, None).
+
+        influxdb-client 1.39 raises influxdb_client.rest.ApiException with
+        .status 422 and the JSON answer in .body (bytes or str); its .message
+        and str() carry the text too.
+        """
+        if getattr(exc, 'status', None) != 422:
+            return False, None
+        body = getattr(exc, 'body', None)
+        if isinstance(body, (bytes, bytearray)):
+            body = body.decode('utf-8', 'replace')
+        for text in (body, getattr(exc, 'message', None), str(exc)):
+            if isinstance(text, str) and 'beyond retention' in text.lower():
+                found = cls._DROPPED_RE.search(text)
+                return True, int(found.group(1)) if found else None
+        return False, None
+
+    def _log_retention_drop(self, records, dropped):
+        """Log a write the bucket stored only in part (see write()): a
+        WARNING the first time, then INFO - a crawl through old gap cells
+        would otherwise log one per call."""
+        times = [t for t in (_observed_epoch(r.get('time')) for r in records)
+                 if t is not None]
+        span = (_fmt_span(min(times), max(times), time.time()) if times
+                else 'unknown times')
+        count = 'some' if dropped is None else str(dropped)
+        if not self._retention_warned:
+            self._retention_warned = True
+            # The first such write is often a back-fill or re-read window
+            # that lies wholly beyond the retention.
+            if dropped is None:
+                kept = 'dropped them and stored the others, if any'
+            elif dropped >= len(records):
+                kept = 'dropped them all'
+            else:
+                kept = 'dropped them and stored the others'
+            logger.warning(
+                "InfluxDB 2 bucket '%s' did not store %s of the %d points "
+                "written for %s: they are older than the bucket keeps (its "
+                "retention), so it %s. Such a write counts as done; later ones "
+                "are logged at INFO", self.bucket, count, len(records), span,
+                kept)
+        else:
+            logger.info("InfluxDB 2 bucket '%s' did not store %s of the %d "
+                        "points written for %s: older than the bucket keeps",
+                        self.bucket, count, len(records), span)
+
+    def bucket_retention(self):
+        """The bucket's retention in seconds (its 'expire' rule); 0 = it
+        keeps everything.  Raises if the bucket cannot be read (a token
+        without that permission, an older server).
+
+        Looked up in ORG: with a token that reads the buckets of every
+        organization (an operator token, as 'influx setup' makes), the
+        name alone can find another organization's bucket of that name
+        first.  ORG is a name or, as the writes take that too, an ID (16
+        hex digits); if it cannot be asked for, by the name alone.
+        """
+        api = self.client.buckets_api()
+        found = None
+        if self.org:
+            key = ('org_id' if re.fullmatch(r'[0-9a-f]{16}', str(self.org))
+                   else 'org')
+            try:
+                found = api.find_buckets(name=self.bucket,
+                                         **{key: self.org}).buckets
+            except Exception:
+                found = None
+        if found is None:
+            bucket = api.find_bucket_by_name(self.bucket)
+        else:
+            bucket = next((b for b in found
+                           if getattr(b, 'name', self.bucket) == self.bucket),
+                          None)
+        if bucket is None:
+            raise LookupError(f"no bucket named '{self.bucket}'")
+        seconds = [rule.every_seconds for rule in (bucket.retention_rules or [])
+                   if getattr(rule, 'type', None) in (None, 'expire')
+                   and rule.every_seconds]
+        return min(seconds) if seconds else 0
 
     def get_last_timestamp(self, measurement_name, sensor_id=None,
                            lookback_min=0):
@@ -1609,6 +1877,11 @@ def process_samples(samples, sensors, measurement_name, my_altitude, noconvert):
 #              pass writes what it holds, then it is dropped if no step in
 #              it is longer than that, and read on as a gap otherwise.  Two
 #              probes merged by a cap stay a probe (the smaller number).
+#   tries      optional: the failed re-read calls in a row of the hole's
+#              last pass, all its cells together; a read that works starts
+#              it over (see _tries_left).  Saved only while a call failed
+#              there, so that a restart grants no fresh tries; releases
+#              before it ignore the key.
 # Keys starting with '_' exist in memory only.
 #
 # The read range [start - RECHECK_MARGIN, end + RECHECK_MARGIN] is split into
@@ -1696,6 +1969,10 @@ def _checked_hole(entry, now):
             'end': float(entry['end']), 'closed_at': float(entry['closed_at']),
             'done': entry['done'], 'pos': entry['pos'], 'cell': entry['cell'],
             'probe': None if probe is None else float(probe)}
+    # Optional; missing or invalid counts as none.
+    tries = entry.get('tries')
+    if _is_count(tries) and tries > 0:
+        hole['tries'] = tries
     # The detector never registers a hole longer than on-board storage plus
     # RECHECK_SPAN_SLACK (see _storage_start); one that is (a damaged file)
     # would cost a call per cell for nothing.  The bound must not depend on
@@ -1849,12 +2126,22 @@ class SensorPushDaemon:
         self._reported_collisions = set()
         self._logged_id_map = False
         self._warned_backlog = False
+        # Cut-offs for sensor error values ([CUTOFFS]), in every mode; parsed
+        # before anything is fetched, like the re-check settings below.  In
+        # memory only: the newest sample of each sensor (stored sensor_id,
+        # epoch) whose temperature was cut off, which the deep scan counts as
+        # the sensor's last data (see _compute_daemon_window), and the
+        # (sensor_id, field) pairs whose first cut value was reported.
+        self._cutoffs = self._cutoff_settings()
+        self._cut_newest = {}
+        self._cut_warned = set()
         # Gap re-checks (RECHECK_GAPS), daemon mode only: holes found in the
         # fetched sample streams, re-read on a schedule because gateways
         # upload missed samples late.  See _note_fetched()/_recheck_gaps().
         # Parsed before anything is fetched: an invalid value ends the
         # process right here.
-        self._recheck_offsets, self._recheck_min_gap = self._recheck_settings()
+        (self._recheck_offsets, self._recheck_min_gap,
+         self._recheck_give_up_after) = self._recheck_settings()
         self._recheck_on = bool(self._recheck_offsets) and bool(args.daemon)
         # Persisted (state.json, key 'rechecks') only while the feature is
         # on: the newest observed time per sensor, and the holes.
@@ -2203,6 +2490,7 @@ class SensorPushDaemon:
 
         # Connect to all backends (with retry)
         self._connect_writers()
+        self._check_bucket_retention()
 
         sd_notify('READY=1')
         sd_status('Starting first collection cycle')
@@ -2281,6 +2569,42 @@ class SensorPushDaemon:
                            "Will keep retrying on each cycle.",
                            ', '.join(failed))
 
+    def _check_bucket_retention(self):
+        """Warn once, at startup, if an InfluxDB 2 bucket drops what the
+        last re-reads write (daemon mode, gap re-checks on).
+
+        A re-read RECHECK_GAPS after a gap closed writes points older than
+        that, so a bucket that keeps no longer than the last offset drops
+        them all (a partial write, see InfluxDB2Writer.write): those calls
+        are made for nothing.  The retention is read once; a lookup that
+        fails (a token without read access to buckets, an older server) is
+        logged at DEBUG, and nothing else depends on it.
+        """
+        if not self._recheck_on:
+            return
+        offs = self._recheck_offsets
+        for w in self.writers:
+            if not isinstance(w, InfluxDB2Writer):
+                continue
+            try:
+                keeps = w.bucket_retention()
+            except Exception as e:
+                logger.debug("Could not read the retention of InfluxDB 2 "
+                             "bucket '%s': %s", w.bucket, e)
+                continue
+            if not keeps or keeps > offs[-1]:
+                continue
+            inside = [o for o in offs if o < keeps]
+            logger.warning(
+                "InfluxDB 2 bucket '%s' keeps %s, and RECHECK_GAPS re-reads "
+                "gaps up to %s after they close: what a re-read writes that "
+                "late is older than the bucket keeps, and InfluxDB 2 drops "
+                "it. %s", w.bucket, _fmt_offset(keeps), _fmt_offset(offs[-1]),
+                'Set RECHECK_GAPS = %s to re-read gaps only within the '
+                'retention' % ', '.join(_fmt_offset(o) for o in inside)
+                if inside else 'No RECHECK_GAPS time is within the '
+                'retention; RECHECK_GAPS = 0 turns the re-checks off')
+
     def _collect_cycle(self):
         """One collection cycle: auth, fetch, process, write."""
         mytz = datetime.timezone(datetime.timedelta(hours=local_time_offset()))
@@ -2299,8 +2623,8 @@ class SensorPushDaemon:
         sensors = self.api.get_sensors()
         self._note_sensors(sensors)
         logger.info("Building voltage records for %d sensors", len(sensors))
-        voltage_records = build_voltage_records(
-            sensors, measurement_name, currenttime)
+        voltage_records = self._apply_cutoffs(build_voltage_records(
+            sensors, measurement_name, currenttime))
         if self.args.dryrun:
             self._log_dryrun(voltage_records)
         else:
@@ -2550,14 +2874,42 @@ class SensorPushDaemon:
                         "Could not query last timestamp for sensor %s "
                         "from %s: %s", sid, wname, e)
                     continue
+                if ts is not None and ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=datetime.timezone.utc)
+                # The sensor's last data is also a sample whose temperature
+                # was cut off ([CUTOFFS]), which no backend holds: else a
+                # sensor sending only error values would look as if it had
+                # fallen behind, and be probed and back-filled every few
+                # deep scans (_handle_sensor_returns).  The backend's newest
+                # point (per_writer) takes only those of the batches it
+                # took (below): one that missed writes must still look
+                # behind.
+                last = ts
+                cut = self._cut_newest.get(sid_tag)
+                if cut is not None:
+                    cut = datetime.datetime.fromtimestamp(
+                        cut, tz=datetime.timezone.utc)
+                    if last is None or cut > last:
+                        last = cut
+                if last is not None and (sid not in per_sensor
+                                         or last < per_sensor[sid]):
+                    per_sensor[sid] = last
                 if ts is None:
                     continue
-                if ts.tzinfo is None:
-                    ts = ts.replace(tzinfo=datetime.timezone.utc)
-                if sid not in per_sensor or ts < per_sensor[sid]:
-                    per_sensor[sid] = ts
                 if wname not in per_writer or ts > per_writer[wname]:
                     per_writer[wname] = ts
+            # A backend that took a batch whose newest samples were cut off
+            # ([CUTOFFS], see _safe_write) holds everything up to them,
+            # though not them.  Else, while every sensor polled sends only
+            # error values, each deep scan would find a collector gap and
+            # fetch all of that again, a window that grows by an hour per
+            # hour.  Only batches it took: one that missed writes still
+            # looks behind.
+            if writer._cut_upto is not None and wname in per_writer:
+                upto = datetime.datetime.fromtimestamp(
+                    writer._cut_upto, tz=datetime.timezone.utc)
+                if upto > per_writer[wname]:
+                    per_writer[wname] = upto
             if failed and wname not in per_writer:
                 unreadable[wname] = last_error
             elif failed:
@@ -2835,32 +3187,71 @@ class SensorPushDaemon:
     # -- gap re-checks ------------------------------------------------------
 
     def _recheck_settings(self):
-        """Parse RECHECK_GAPS and RECHECK_MIN_GAP (daemon mode only).
+        """Parse RECHECK_GAPS, RECHECK_MIN_GAP and RECHECK_GIVE_UP_AFTER
+        (daemon mode only).
 
-        Returns (offsets in seconds, min gap in seconds); no offsets means
-        off, and one-shot mode ignores both keys.  An invalid value ends the
-        process with status 2 before anything is fetched or connected:
-        running without the re-checks someone configured - or with the ones
-        they meant to turn off - would only be noticed much later.
+        Returns (offsets in seconds, min gap in seconds, failed calls after
+        which a last re-read is given up); no offsets means off, and one-shot
+        mode ignores all three keys.  An invalid value ends the process with
+        status 2 before anything is fetched or connected: running without the
+        re-checks someone configured - or with the ones they meant to turn
+        off - would only be noticed much later.
         """
         if not self.args.daemon:
-            return [], 0
+            return [], 0, 0
         daemon_cfg = self.config['daemon']
         try:
             offsets = parse_recheck_gaps(daemon_cfg.get(
                 'recheck_gaps', DEFAULT_RECHECK_CFG['recheck_gaps']))
             if not offsets:
-                return [], 0
+                return [], 0, 0
             min_gap = parse_recheck_min_gap(daemon_cfg.get(
                 'recheck_min_gap', DEFAULT_RECHECK_CFG['recheck_min_gap']))
+            give_up_after = parse_recheck_give_up_after(daemon_cfg.get(
+                'recheck_give_up_after',
+                DEFAULT_RECHECK_CFG['recheck_give_up_after']))
         except ValueError as e:
             logger.error("Invalid [DAEMON] setting: %s", e)
             sys.exit(2)
         logger.info("Gap re-checks: gaps over %s are read again %s after they "
-                    "close (RECHECK_GAPS = 0 turns this off)",
+                    "close (RECHECK_GAPS = 0 turns this off); a last re-read "
+                    "is given up after %d failed call%s in a row",
                     _fmt_offset(min_gap),
-                    ', '.join(_fmt_offset(o) for o in offsets))
-        return offsets, min_gap
+                    ', '.join(_fmt_offset(o) for o in offsets), give_up_after,
+                    '' if give_up_after == 1 else 's')
+        return offsets, min_gap, give_up_after
+
+    def _cutoff_settings(self):
+        """Parse [CUTOFFS] (every mode): {field: (floor, ceiling)}, {} = none.
+
+        An invalid section ends the process with status 2 before anything is
+        fetched or connected, as an invalid RECHECK_GAPS does: storing the
+        error values someone meant to cut off - or cutting real readings -
+        would only be noticed much later.
+        """
+        raw = self.config.get('cutoffs')
+        misnamed = self.config.get('cutoffs_misnamed')
+        if not raw and not misnamed:
+            return {}
+        try:
+            if misnamed:
+                raise ValueError(
+                    '%s %s not read: the section must be called [CUTOFFS] '
+                    '(section names are case-sensitive)' % (
+                        ', '.join(f'[{name}]' for name in misnamed),
+                        'is' if len(misnamed) == 1 else 'are'))
+            cutoffs = parse_cutoffs(raw)
+        except ValueError as e:
+            logger.error("Invalid [CUTOFFS] setting: %s", e)
+            sys.exit(2)
+        if cutoffs:
+            logger.info(
+                "Cut-offs: %s. A value at or below its floor, or at or above "
+                "its ceiling, is not stored, nor are the values computed from "
+                "it", ', '.join(f'{_cutoff_key(f, c)} = {b[c]:g}'
+                                for f, b in cutoffs.items()
+                                for c in (0, 1) if b[c] is not None))
+        return cutoffs
 
     def _recheck_cell_min(self):
         """Cell length L in minutes for new holes.
@@ -2942,11 +3333,16 @@ class SensorPushDaemon:
 
     def _recheck_payload(self):
         """The 'rechecks' value for state.json: persisted keys only."""
-        return {
-            'last_seen': dict(self._recheck_last_seen),
-            'holes': [{k: (list(h[k]) if k == 'counts' else h.get(k))
-                       for k in HOLE_KEYS} for h in self._recheck_holes],
-        }
+        holes = []
+        for h in self._recheck_holes:
+            entry = {k: (list(h[k]) if k == 'counts' else h.get(k))
+                     for k in HOLE_KEYS}
+            # Optional: only while calls of the hole's last pass have failed
+            # since its last read that worked.
+            if h.get('tries'):
+                entry['tries'] = h['tries']
+            holes.append(entry)
+        return {'last_seen': dict(self._recheck_last_seen), 'holes': holes}
 
     def _warn_once(self, key, msg, *args):
         """Log a WARNING once per process for each key."""
@@ -3239,6 +3635,12 @@ class SensorPushDaemon:
             a['counts'] = [0] * _hole_ncells(a)
             a['probe'] = (min(a['probe'], b['probe'])
                           if a.get('probe') and b.get('probe') else None)
+            # Read from the earlier schedule (done above): so are its tries.
+            tries = min(a.get('tries', 0), b.get('tries', 0))
+            if tries:
+                a['tries'] = tries
+            else:
+                a.pop('tries', None)
             for key in _HOLE_PASS_KEYS + ('_errors',):
                 a.pop(key, None)
             own[:] = [h for h in own if h is not b]
@@ -3503,27 +3905,28 @@ class SensorPushDaemon:
         alone back-off runs.
 
         Those after the others are of two kinds (_kept_kind).  A cell of
-        the kept kind is its cell's last read: the tries of its grace day go
-        by while it waits, and after the grace end one failed call gives it
-        up.  The others get their calls later.  That costs nothing while
-        the cloud and the bucket still hold their history, except for a
-        cell whose read is its cell's last but whose last failed call a
-        backend refused: it waits with the others, the tries of its grace
-        day go by too, and after the grace end one failed call gives it up.
-        With a bucket retention, history can age out meanwhile.  When both
-        kinds are due they take every other call, and a kind that is due
-        alone takes every call; ``kept`` tells the caller, which keeps the
-        alternation, which kind the call is for (None: neither).  Within
-        each kind, _alone_order.  For the others that means one gap at a
-        time: a carry counts as never read alone, so a gap whose cells are
-        being skipped one by one stays ahead of every cell already read
-        alone.  Several gaps that keep failing - e.g. crawls through the
-        cells older than a bucket's retention - therefore crawl one after
-        another, the most overdue first, each one cell per step of the
-        alone back-off (up to an hour), or per two steps while a cell of
-        the kept kind is due.  Taking turns, each would crawl at a fraction
-        of that speed, and all of them could fall behind the retention
-        boundary, which moves an hour per hour.
+        the kept kind is its cell's last read: the failed call that uses up
+        its gap's RECHECK_GIVE_UP_AFTER tries gives it up (_tries_left).
+        The others get their calls later.  That costs nothing while the
+        cloud and the bucket still hold their history - waiting uses none of
+        a gap's tries, only its failed calls do - except for a cell whose
+        read is its cell's last but whose last failed call a backend
+        refused: it waits with the others, and a refused call after the
+        hole's grace end gives it up (_cell_failed_out).  With a bucket
+        retention, history can age out meanwhile.  When both kinds are due
+        they take every other call, and a kind that is due alone takes every
+        call; ``kept`` tells the caller, which keeps the alternation, which
+        kind the call is for (None: neither).  Within each kind,
+        _alone_order.  For the others that means one gap at a time: a carry
+        counts as never read alone, so a gap whose cells are being skipped
+        one by one stays ahead of every cell already read alone.  Several
+        gaps that keep failing - e.g. crawls through cells whose records a
+        backend keeps refusing - therefore crawl one after another, the most
+        overdue first, each one cell per step of the alone back-off (up to
+        an hour), or per two steps while a cell of the kept kind is due.
+        Taking turns, each would crawl at a fraction of that speed, and with
+        a bucket retention all of them could fall behind its boundary, which
+        moves an hour per hour.
         """
         alone_ok = (self._recheck_alone_next_at is None
                     or time.monotonic() >= self._recheck_alone_next_at)
@@ -3567,15 +3970,17 @@ class SensorPushDaemon:
         (its window's read alone or its regroup failed, see
         _read_alone_decides) on the hole's last pass - 'at' is set: not a
         carry, which has not failed yet.  A carry on the last pass follows
-        a cell given up after the grace end, so its single call comes after
-        it wherever it sorts.
+        a cell that was given up: if its gap's tries were used up, its
+        failed call gives it up too, wherever it sorts; if a backend refused
+        that cell after the grace end, a refused call does.
 
-        A cell whose records a backend refused - most often points older
-        than a bucket's retention, a 422 - cannot be written while it does:
-        with a bucket of 7 days or less, every 7d read that finds samples
-        the earlier reads did not is such a cell.  Its tries would be
+        A cell whose records a backend refused is likely to be refused
+        again: the backend is down for longer than that call, or rejects
+        those records for good (an InfluxDB 2 422 for a field type
+        conflict, say; its 422 for points older than the bucket keeps is a
+        completed write, see InfluxDB2Writer.write).  Its tries would be
         futile, and would halve the speed of every crawl through such cells
-        while history ages out of the bucket.  So it waits with the others,
+        while history can age out of a bucket.  So it waits with the others,
         and still gets its calls there; a later failed call that was not
         refused (the API failed) gives it its turn back.
         """
@@ -3596,24 +4001,24 @@ class SensorPushDaemon:
         read alone, so the gap whose cells are being skipped goes on with
         its next cell, ahead of every cell read alone before.
 
-        Past its grace end a kept cell among the others (its last failed
-        call was refused, see _kept_kind) counts as never read alone too,
-        if its hole has a next cell: its next failed call gives it up, and
-        its hole goes on from there, like a carry.  It stands where its
-        carry would stand had it been given up at the grace end without a
-        call.  Sorted with the cells read alone, it could wait behind the
-        crawls of less overdue gaps while its own gap's history aged out of
-        the bucket.  A hole's last cell has no carry to stand for: its call
-        only gives it up, and waits like any cell read alone.  A kept cell
-        of the kept kind keeps its turn: put ahead of the kept cells still
-        in their grace day, its single call would come at once, perhaps
-        while the calls still fail, and give it up, and the others would
-        lose turns of their grace day."""
+        Once its next refused call gives it up - past the hole's grace end,
+        or with one try left (_tries_left) - a kept cell among the others
+        (its last failed call was refused, see _kept_kind) counts as never
+        read alone too, if its hole has a next cell: its hole goes on from
+        there, like a carry.  It stands where its carry would stand had it
+        been given up without that call.  Sorted with the cells read alone,
+        it could wait behind the crawls of less overdue gaps while its own
+        gap's history aged out of the bucket.  A hole's last cell has no
+        carry to stand for: its call only gives it up, and waits like any
+        cell read alone.  A kept cell of the kept kind keeps its turn: put
+        ahead of the other kept cells, its last call would come at once,
+        perhaps while the calls still fail, and give it up."""
         fail = self._fail_record(e)
         tried = fail['tried'] if fail else None
         if (tried is not None and fail['n'] >= RECHECK_CELL_MAX_FAILS
                 and fail['refused']
-                and now > self._grace_end(e['hole'])
+                and (self._tries_left(e['hole']) <= 1
+                     or now > self._grace_end(e['hole']))
                 and e['k'] < _hole_ncells(e['hole']) - 1):
             tried = None
         return (tried is not None, tried or 0.0, e['due_at'],
@@ -3702,9 +4107,10 @@ class SensorPushDaemon:
         while only they wait, both lines are DEBUG (with polls 40-59 min
         apart they are due most cycles).  The lines say what each backend
         did: it cannot be told whether a backend that failed its last write
-        is down or refused only that call's records (a 422 for points
-        beyond a bucket's retention), and the reader should not be told it
-        is down when it took every other write.
+        is down or refused only that call's records (an InfluxDB 2 422 for
+        a field type conflict, say; its 422 for points beyond the bucket's
+        retention is a completed write, see InfluxDB2Writer.write), and the
+        reader should not be told it is down when it took every other write.
         """
         if self.args.dryrun:
             return True
@@ -3776,6 +4182,7 @@ class SensorPushDaemon:
         taken = {}     # sid -> indices already contributed by this call
         records = []
         results = []
+        cut = {}       # error values left out, for one INFO line (_log_cuts)
         for e in batch:
             hole = e['hole']
             before = len(records)
@@ -3794,20 +4201,24 @@ class SensorPushDaemon:
                 n = len(interior)
                 # A probe's margins can hold an own sample the window left
                 # out even when its interior is empty: its one read writes.
+                # (The counts are of the samples served, error values
+                # included: a sensor sending only those has no gap.)
                 if n > hole['counts'][e['k']] or (hole.get('probe')
                                                   and hole['done'] == 0):
                     seen = taken.setdefault(sid, set())
                     new = sorted(i for _, i in cell if i not in seen)
                     if new:
-                        records.extend(process_samples(
+                        records.extend(self._cut_records(process_samples(
                             {'sensors': {sid: [data[sid][i] for i in new]}},
                             sensors, measurement_name,
-                            self.config['my_altitude'], self.args.noconvert))
+                            self.config['my_altitude'], self.args.noconvert),
+                            cut))
                         seen.update(new)
                 hole.pop('_errors', None)
                 results.append((e, n, interior, len(records) - before))
             except Exception as exc:
                 self._hole_error(hole, sensors, now, exc)
+        self._log_cuts(cut)
         for i in range(0, len(records), RECHECK_WRITE_SLICE):
             part = records[i:i + RECHECK_WRITE_SLICE]
             if self.args.dryrun:
@@ -3884,12 +4295,15 @@ class SensorPushDaemon:
 
         Records the call's window (see _read_alone_decides), whether a
         backend refused its records (``refused``, see _kept_kind) and, for
-        a call read alone, when it was tried (see _alone_order).  A cell
-        that reached RECHECK_CELL_MAX_FAILS failed calls in a row is then
-        skipped, kept or given up by _cell_failed_out().
+        a call read alone, when it was tried (see _alone_order).  On a last
+        pass the call also uses one of the hole's tries (_tries_left).  A
+        cell that reached RECHECK_CELL_MAX_FAILS failed calls in a row is
+        then skipped, kept or given up by _cell_failed_out().
         """
         for e in batch:
             hole = e['hole']
+            if self._last_pass(hole, now):
+                hole['tries'] = hole.get('tries', 0) + 1
             fail = self._fail_record(e)
             if fail is None:
                 fail = hole['_fail'] = self._new_fail(e['k'])
@@ -3909,37 +4323,71 @@ class SensorPushDaemon:
         its count stays, so the next pass reads it again.  A window the API
         or a backend always refuses then costs a few calls per pass and
         never stops the other re-reads.  The last pass has no next one: its
-        cell is kept, and tried again alone in its turn.  Only a call that
-        fails after the hole's grace end gives it up - never the clock
-        alone: its last try may lie far back (the turns of other kept
-        cells, a spell of failing polls), and it may work now.  A skipped
-        or given-up cell's hole goes on with its next cell, as a carry
-        (_skip_cell).  The WARNINGs give the failed calls actually made for
-        the cell.
+        cell is kept, and tried again alone in its turn.  Only a failed call
+        gives it up - never the clock: its tries may lie far apart (the
+        turns of other kept cells, a spell of failing polls), and the next
+        one may work.  That is the failed call that uses up the hole's tries
+        (_tries_left), or a refused call after the hole's grace end: a
+        backend that still refuses those records will most likely refuse
+        them again, and its tries would hold up the hole's crawl towards the
+        cells it takes - late history that only the last pass can write,
+        while it ages out of a bucket.  A skipped or given-up cell's hole
+        goes on with its next cell, as a carry (_skip_cell).  The WARNINGs
+        give the failed calls actually made for the cell, and why a cell is
+        given up.
         """
         name = (sensors.get(hole['sid']) or {}).get('name', hole['sid'])
         text = self._window_text(*fail['at'])
+        left = self._tries_left(hole)
         if not self._last_pass(hole, now):
             logger.warning("Re-reading %s for the gap in '%s' %s; skipped "
                            "for this pass, the next one reads it again",
                            text, name, _fmt_failed(fail['calls']))
-        elif now <= self._grace_end(hole):
+        elif left > 0 and not (fail['refused']
+                               and now > self._grace_end(hole)):
             if fail['n'] == RECHECK_CELL_MAX_FAILS:
                 logger.warning(
                     "Re-reading %s for the gap in '%s' %s; this is its last "
-                    "re-read, so it is tried again until it works or a call "
-                    "after %s fails", text, name, _fmt_failed(fail['calls']),
-                    _fmt_time(self._grace_end(hole)))
+                    "re-read, so it is tried again until it works or %d more "
+                    "call%s failed (RECHECK_GIVE_UP_AFTER = %d)%s", text, name,
+                    _fmt_failed(fail['calls']), left,
+                    ' has' if left == 1 else 's have',
+                    self._recheck_give_up_after,
+                    ', or a backend refuses it again after %s'
+                    % _fmt_time(self._grace_end(hole)) if fail['refused']
+                    else '')
             return
         else:
-            logger.warning("Re-reading %s for the gap in '%s' %s; its last "
-                           "re-read is given up", text, name,
-                           _fmt_failed(fail['calls']))
+            logger.warning(
+                "Re-reading %s for the gap in '%s' %s; its last re-read is "
+                "given up %s", text, name, _fmt_failed(fail['calls']),
+                'after %d failed calls in a row for the gap '
+                '(RECHECK_GIVE_UP_AFTER = %d)' % (hole.get('tries', 0),
+                                                  self._recheck_give_up_after)
+                if left <= 0 else
+                'as a backend still refuses its records after %s, a day '
+                'after it was due' % _fmt_time(self._grace_end(hole)))
         self._skip_cell(hole, k, now, sensors, cap)
 
+    def _tries_left(self, hole):
+        """The failed calls the hole's last pass may still make: the
+        RECHECK_GIVE_UP_AFTER tries minus the failed calls in a row of that
+        pass, all its cells together ('tries': counted by _recheck_failed,
+        started over by a read that works, _advance_hole, and kept in
+        state.json, so a restart grants no fresh ones).  Calls, not time:
+        waiting uses none, and while every re-read call fails, the cells
+        read alone share one back-off (up to an hour), so a single gap
+        outlasts nearly two days of failing calls with the default 48.  In
+        a row, not in all: a long gap's last pass is many calls, and the
+        transient failures of the cells read since must not use up the
+        tries of a cell that fails now.  The failed call that brings it to 0
+        gives up the cell (_cell_failed_out), and then each later cell of
+        the hole, a carry, is given up by its first failed call."""
+        return self._recheck_give_up_after - hole.get('tries', 0)
+
     def _grace_end(self, hole):
-        """After this, a failed call gives up a kept cell of the hole's
-        last pass (see _cell_failed_out)."""
+        """After this - a day after the hole's last offset - a refused call
+        gives up a kept cell of its last pass (see _cell_failed_out)."""
         return (hole['closed_at'] + self._recheck_offsets[-1]
                 + RECHECK_LAST_PASS_GRACE)
 
@@ -3952,11 +4400,11 @@ class SensorPushDaemon:
         it can neither fail nor hold up.  A successful read clears that.
         The carry counts as never read alone (see _alone_order), so it
         comes before every cell already read alone: a gap that crawls
-        through a run of failing cells, such as those older than a bucket's
-        retention, goes on towards the cells that can be written, one cell
-        per step of the alone back-off (one per two steps while a cell of
-        the kept kind is due, see _recheck_pick), unless a more overdue
-        gap's crawl is under way.
+        through a run of failing cells, such as cells whose records a
+        backend keeps refusing, goes on towards the cells that can be
+        written, one cell per step of the alone back-off (one per two steps
+        while a cell of the kept kind is due, see _recheck_pick), unless a
+        more overdue gap's crawl is under way.
         """
         hole.setdefault('_since', now)
         hole.pop('_fail', None)
@@ -3985,11 +4433,12 @@ class SensorPushDaemon:
           in step, and the hole read alone does not run ahead and split it.
           Once per cell and pass: if that call fails too, they are read
           alone.
-        - It failed: the window is likely to fail for them too (a backend's
-          retention, a window the API refuses).  They are read alone after
-          the cells read together, so they hold up no cell read together:
-          with the kept cells if the hole is on its last pass and no backend
-          refused their records, else with the carries (see _kept_kind).
+        - It failed: the window is likely to fail for them too (a backend
+          that refuses those records, a window the API refuses).  They are
+          read alone after the cells read together, so they hold up no cell
+          read together: with the kept cells if the hole is on its last pass
+          and no backend refused their records, else with the carries (see
+          _kept_kind).
         """
         if failed.get('n') != 2 or failed.get('at') is None:
             return
@@ -4032,6 +4481,9 @@ class SensorPushDaemon:
         hole['_found'] = hole.get('_found', 0) + n
         hole['_new'] = hole.get('_new', 0) + max(0, n - before)
         hole.pop('_fail', None)
+        # The tries count failed calls in a row (_tries_left): a read that
+        # works starts them over.
+        hole.pop('tries', None)
         chain = ({'k': 0, 'first': None, 'last': None, 'inner': 0.0}
                  if k == 0 else hole.get('_chain'))
         if chain is not None and chain['k'] == k:
@@ -4159,6 +4611,12 @@ class SensorPushDaemon:
                             _fmt_offset(offs[later[0]]))
         if hole['done'] >= len(offs):
             self._finish_hole(hole, sensors, now)
+        else:
+            # A pass that ends with the hole still open was not its last
+            # (RECHECK_GAPS gained a later offset, or a restart in the
+            # middle of a collapsed last pass made it an earlier one): the
+            # last pass counts its own tries.
+            hole.pop('tries', None)
 
     def _finish_hole(self, hole, sensors, now):
         """All re-reads of a hole are done: drop it, with a summary."""
@@ -4252,20 +4710,23 @@ class SensorPushDaemon:
                 logger.info("Samples: %d, Sensors: %d",
                             numsamples, numsensors)
 
-                records = process_samples(
+                cut = {}
+                records = self._apply_cutoffs(process_samples(
                     samples, sensors, measurement_name,
-                    self.config['my_altitude'], self.args.noconvert)
+                    self.config['my_altitude'], self.args.noconvert), cut)
 
                 if self.args.dryrun:
                     self._log_dryrun(records)
                     written = True
                 else:
-                    written = self._safe_write(records)
+                    written = self._safe_write(records, cut.get(None))
                     if written:
                         self._mark_success()
 
                 # Gap detection.  Isolated: it can never fail, repeat or
-                # change the window that was just handled.
+                # change the window that was just handled.  It sees the
+                # samples served, also those cut off: a sensor sending only
+                # error values has no gap.
                 if self._recheck_on:
                     self._note_fetched_safely(samples, sensors, window,
                                               sensor_filter)
@@ -4303,12 +4764,127 @@ class SensorPushDaemon:
                             RETRYWAIT, retrycount, MAXRETRY)
                 self._interruptible_sleep(RETRYWAIT)
 
-    def _safe_write(self, records):
+    def _apply_cutoffs(self, records, cut=None):
+        """_cut_records() for one batch, with its INFO line; ``cut``, if
+        given, gets what was cut (see _cut_records)."""
+        cut = {} if cut is None else cut
+        records = self._cut_records(records, cut)
+        self._log_cuts(cut)
+        return records
+
+    def _cut_records(self, records, cut):
+        """The records without the values [CUTOFFS] marks as error values.
+
+        A value at or below its field's floor, or at or above its ceiling,
+        is left out, and so are the values computed from it (CUTOFF_DERIVED:
+        dewpoint, vpd and abs_humidity from temperature or humidity,
+        abs_humidity and altitude from pressure); the other values stay.  A
+        record left without any of CUTOFF_KEEPS is left out.  Changed
+        records are copies; when nothing is cut the very same list comes
+        back.  ``cut`` counts, per (sensor name, field), the error values
+        and, per (sensor name, None), the records left out (see _log_cuts).
+
+        A sample whose temperature is cut is noted (_cut_newest): no backend
+        holds it, and the deep scan counts it as the sensor's last data.
+        cut[None] is the newest of them in the batch: a backend that takes
+        the batch holds everything up to it (see _safe_write).
+        """
+        if not self._cutoffs:
+            return records
+        out = []
+        changed = False
+        for r in records:
+            fields = r['fields']
+            bad = [f for f, v in fields.items() if self._cut_bound(f, v)]
+            if not bad:
+                out.append(r)
+                continue
+            changed = True
+            tags = r['tags']
+            name = str(tags.get('sensor_name', tags.get('sensor_id')))
+            drop = set(bad)
+            for f in bad:
+                drop.update(CUTOFF_DERIVED.get(f, ()))
+                cut[(name, f)] = cut.get((name, f), 0) + 1
+                self._warn_cut(tags.get('sensor_id'), name, f, fields[f],
+                               r['time'])
+            t = _observed_epoch(r['time'])
+            if 'temperature' in bad and t is not None:
+                tag = tags.get('sensor_id')
+                self._cut_newest[tag] = max(self._cut_newest.get(tag, t), t)
+                cut[None] = max(cut.get(None, t), t)
+            kept = {f: v for f, v in fields.items() if f not in drop}
+            if any(f in kept for f in CUTOFF_KEEPS):
+                out.append(dict(r, fields=kept))
+            else:
+                cut[(name, None)] = cut.get((name, None), 0) + 1
+        return out if changed else records
+
+    def _cut_bound(self, field, value):
+        """(True for a ceiling, the cut-off) that marks the value of a field
+        an error value; None if it is no error value."""
+        floor, ceiling = self._cutoffs.get(field, (None, None))
+        if floor is not None and value <= floor:
+            return False, floor
+        if ceiling is not None and value >= ceiling:
+            return True, ceiling
+        return None
+
+    def _warn_cut(self, tag, name, field, value, when):
+        """A WARNING for the first value cut off per sensor and field."""
+        if (tag, field) in self._cut_warned:
+            return
+        self._cut_warned.add((tag, field))
+        ceiling, bound = self._cut_bound(field, value)
+        t = _observed_epoch(when)
+        derived = CUTOFF_DERIVED.get(field)
+        logger.warning(
+            "Sensor '%s': %s %g at %s is at or %s %s = %g, an error value: "
+            "it is not stored%s. Further error values of its %s are counted "
+            "in INFO lines", name, field, value,
+            _fmt_time(t) if t is not None else when,
+            'above' if ceiling else 'below', _cutoff_key(field, ceiling),
+            bound, ', nor are %s and %s, computed from it' % (
+                ', '.join(derived[:-1]), derived[-1]) if derived else '',
+            field)
+
+    def _log_cuts(self, cut):
+        """One INFO line for the error values a batch left out, per sensor
+        and field (see _cut_records)."""
+        cut = {key: count for key, count in cut.items() if key is not None}
+        if not cut:
+            return
+        per_sensor = {}
+        for (name, field), count in cut.items():
+            per_sensor.setdefault(name, {})[field] = count
+        parts = []
+        for name in sorted(per_sensor):
+            counts = per_sensor[name]
+            text = ', '.join(f'{f} {counts[f]}' for f in CUTOFF_FIELDS
+                             if f in counts)
+            if counts.get(None):
+                text += ' (%d record%s not stored at all)' % (
+                    counts[None], '' if counts[None] == 1 else 's')
+            parts.append(f"'{name}' {text}")
+        logger.info("Cut-offs left out %d error value(s): %s",
+                    sum(n for (_, f), n in cut.items() if f is not None),
+                    '; '.join(parts))
+
+    def _safe_write(self, records, cut_upto=None):
         """Write records to all backends with retry and reconnection.
 
         Returns True if at least one backend accepted the batch.  In
         daemon mode a total failure is reported rather than raised, so
-        the caller can decline to advance the high-water mark.
+        the caller can decline to advance the high-water mark.  A write
+        InfluxDB 2 stored only in part, as some points were older than the
+        bucket keeps, was accepted: InfluxDB2Writer.write returns normally,
+        and the points it dropped can never be stored.
+
+        ``cut_upto`` is the newest time of a sample of the batch whose
+        temperature [CUTOFFS] cut off (see _cut_records), if any: each
+        backend that takes the batch - also an empty one, all of it cut -
+        holds everything up to it, though not it (see
+        _compute_daemon_window).
         """
         all_failed = True
         for writer in self.writers:
@@ -4341,6 +4917,9 @@ class SensorPushDaemon:
                                 type(writer).__name__, len(records),
                                 time.time() - t0)
                     writer._consecutive_failures = 0
+                    if cut_upto is not None and (writer._cut_upto is None
+                                                 or cut_upto > writer._cut_upto):
+                        writer._cut_upto = cut_upto
                     all_failed = False
                     break
                 except Exception as e:

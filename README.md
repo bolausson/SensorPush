@@ -113,6 +113,17 @@ POLL_BACKLOG = 1h
 RECHECK_GAPS = 1h, 6h, 1d, 3d, 7d
 # The shortest silence of a sensor that counts as a gap
 RECHECK_MIN_GAP = 20m
+# Failed calls in a row after which a gap's last re-read is given up
+RECHECK_GIVE_UP_AFTER = 48
+
+[CUTOFFS]
+# Optional, no cut-off by default: sensor error values not to store, see
+# "Sensor error values and cut-offs".  <METRIC>_FLOOR and <METRIC>_CEILING
+# for TEMPERATURE, HUMIDITY, PRESSURE, DISTANCE, DEWPOINT, VPD, ABS_HUMIDITY,
+# ALTITUDE, VOLTAGE and RSSI.  The recommended values for a failed chip's
+# error values; check your own data before you set them:
+# TEMPERATURE_FLOOR = -40
+# HUMIDITY_FLOOR = 0
 
 [MISC]
 MY_ALTITUDE = 0.0
@@ -213,7 +224,8 @@ the minute and usually within a minute of the copy (before or after it, dependin
 sensor). After about half an hour the API normally serves only the sensor's own samples,
 so a later re-read or back-fill returns only those.
 
-The daemon stores every sample the API serves. With the default settings a sensor
+The daemon stores every sample the API serves, except values `[CUTOFFS]` marks as
+errors (see "Sensor error values and cut-offs"). With the default settings a sensor
 therefore has about twice as many points as a re-read returns. Data written by versions
 with a 10-minute backlog contains live copies too, and so can data from the old scripts;
 a back-fill does not remove them. This is on purpose: the live copies are the only data
@@ -258,6 +270,74 @@ SELECT "gap" FROM (
   WHERE $timeFilter GROUP BY "sensor_name"
 ) WHERE "gap" > 60 GROUP BY "sensor_name"
 ```
+
+### Sensor error values and cut-offs
+
+A sensor whose temperature and humidity chip fails keeps reporting, and the API serves
+its error values like any reading: an HT1 reports -46.83 or -46.84 °C (the chip's raw 0:
+-46.85 + 175.72 x 0) with 0 % humidity (-5.97 % in data from before about 2023), an
+HTP.xw exactly -40 °C with 0 %. The dewpoint (0), vpd (0.1 to 0.2) and abs_humidity (0)
+of such a point are computed from those and are garbage too. An HTP.xw's pressure stays
+valid: only its temperature and humidity chip failed. Some points have only the humidity
+wrong (0 % or -5.94 %), with a valid temperature.
+
+The daemon stores every value unless the optional `[CUTOFFS]` section marks it as an
+error value. It holds a floor and a ceiling per metric, `<METRIC>_FLOOR` and
+`<METRIC>_CEILING`, named after the stored field: `TEMPERATURE`, `HUMIDITY`,
+`PRESSURE`, `DISTANCE`, `DEWPOINT`, `VPD`, `ABS_HUMIDITY` and `ALTITUDE` for the
+samples, `VOLTAGE` and `RSSI` for the status records (measurement
+`<MEASUREMENT_NAME>_V`).
+
+- A value **at or below** its floor, or **at or above** its ceiling, is an error value
+  and is not stored. The cut-off itself counts as an error, so a floor can be set to a
+  sensor's error value: `TEMPERATURE_FLOOR = -40` drops -40 and -46.84 °C,
+  `HUMIDITY_FLOOR = 0` drops 0 % and -5.97 %. The same goes for a ceiling:
+  `HUMIDITY_CEILING = 100` would drop real readings of 100 %.
+- The values are in the unit the daemon stores: °C for temperature and dewpoint, %,
+  mBar for pressure and vpd, g/m³, m for altitude and distance, V and dBm. With
+  `-n`/`--noconvert` the daemon stores the API's units instead: °F, inHg, kPa and ft
+  (-40 is the same in °C and °F).
+- Per value, not per sample: the other values of a sample are stored, except those
+  computed from an error value, whether the API or the daemon computed them - dewpoint,
+  vpd and abs_humidity when temperature or humidity is one, abs_humidity and altitude
+  when pressure is. A sample left with none of temperature, humidity, pressure and
+  distance is not stored at all (its altitude alone means nothing), nor is a status
+  record left with neither voltage nor rssi. So an HT1 error point is not stored, an
+  HTP.xw error point keeps its pressure and altitude, and a point with only the humidity
+  wrong keeps its temperature.
+- A record without a field is not affected by that field's cut-offs. A status record
+  carries a voltage of 0.0 when the API reports none: an ordinary value here, so
+  `VOLTAGE_FLOOR = 0` drops it.
+- Without the section, or with a key missing or left empty, there is no cut-off for
+  that bound - the default for every bound, so a config without the section stores
+  exactly what it did. A value that is not a number, an unknown key (a typo) or a floor
+  at or above the ceiling of the same metric stops the daemon at startup, in every mode,
+  with a one-line error naming the key and listing the valid ones; so does a section
+  named like it but not exactly `[CUTOFFS]`, such as `[cutoffs]` or `[CUTOFF]` (section
+  names are case-sensitive). Legacy config files may have a `[CUTOFFS]` section too.
+- Every run that stores records applies them: one-shot runs, polls, back-fills, gap
+  re-reads and the status records; a dry run shows what would be stored. Gap detection
+  still sees every sample the API serves, so a sensor that sends only error values has no
+  gap, and it does not look as if it had fallen behind: the deep scan counts its newest
+  sample, stored or cut off, as its last data, and a backend that took the batches of
+  such samples as holding everything up to them, so even while every sensor polled sends
+  only error values, a deep scan fetches no more than without cut-offs. After a restart,
+  which forgets what was cut, the time since the last stored reading may be fetched once
+  more, and such a sensor back-filled once.
+- Each batch that cut values logs one INFO line with the counts per sensor and metric.
+  The first value cut per sensor and metric logs a WARNING with the value, its time and
+  the key, once per process.
+- The daemon never changes points already stored: error values written before the
+  section was set stay until they are deleted in the database.
+
+On one installation (18 sensors, 2018 to 2026, 5,081 error points: 5,058 with both
+temperature and humidity at the error value, 1,698 of them HTP.xw points with a valid
+pressure of 1011 to 1031 mBar, and 23 with only the humidity wrong), `TEMPERATURE_FLOOR =
+-40` and `HUMIDITY_FLOOR = 0` catch every error value and no real reading: the coldest
+real temperature there is -21.32 °C (a freezer), no real humidity is at or below 0.5 %,
+and SensorPush rates HT1, HT.w and HTP.xw sensors from -40 °C. That is the
+recommendation; check your own data before setting them, as no cut-off is set by
+default.
 
 ### Gap re-checks
 
@@ -318,35 +398,45 @@ What it costs:
   fails 3 times in a row is left for the gap's next re-read; the gap's next window is then
   read alone and left after one failed call.
 - The last re-read has no next one. There a window that fails 3 times is kept and tried
-  again, alone. It is given up only when a call more than a day after the last re-read
-  time fails, so after that day it costs one call at most; each later window of the gap
-  is then given up after one failed call. A re-read whose later times all went by while
-  re-reads could not run is the last one too. A re-read that had begun before them and
-  was cut short (the Pi off, a backend failing) is not: the last re-read still follows,
-  and reads the whole gap again.
+  again, alone. It is given up by the 48th failed call in a row of the gap's last
+  re-read (`RECHECK_GIVE_UP_AFTER`: the failed calls of all its windows together, until
+  a read of the gap works); each later window of the gap is then given up after one
+  failed call. The first window to be given up still fails 3 times in a row first, also
+  with a `RECHECK_GIVE_UP_AFTER` below 3. These are calls, not time: waiting uses
+  none of them, and while every re-read call fails, the windows read alone share one
+  pause, which grows to an hour, so one gap outlasts nearly two days of failing calls
+  (about 43 hours at an `INTERVAL` of 5 minutes), several gaps longer, and a gap that
+  never works costs at most 48 failed calls plus one per remaining window. A window that
+  fails while other calls work is tried again sooner, and given up sooner. The count is
+  kept in `state.json`, so a restart grants no fresh tries. A window whose last write a
+  backend refused is given up sooner: by a refused call more than a day after the last
+  re-read time, as the backend will most likely go on refusing it, and the gap's
+  windows that it would take wait behind it. A re-read whose later times all went by
+  while re-reads could not run is the last one too. A re-read that had begun before them
+  and was cut short (the Pi off, a backend failing) is not: the last re-read still
+  follows, and reads the whole gap again.
 - Of the reads alone after the gaps read together, windows read for the last time get
   every other one while other windows wait too: windows kept on a gap's last re-read
   (see the previous point), and the other windows of a gap's last re-read that failed
-  twice and are read alone. The tries of that day go by while they wait. A window whose
-  last write a backend refused does not take that turn: the backend will most likely
-  refuse it again (its points are older than a bucket's retention, say), and those tries
-  would halve the speed of the other windows. It waits with them and still gets its
-  calls; a later call that fails before the write (at the API, say) gives it the turn
-  back.
+  twice and are read alone. A window whose last write a backend refused does not take
+  that turn: the backend will most likely refuse it again (its points are older than the
+  backend keeps, say, or a field type conflict), and those tries would halve the speed
+  of the other windows. It waits with them and still gets its calls; a later call that
+  fails before the write (at the API, say) gives it the turn back.
 - The other windows read alone go one gap at a time. In each of the two groups, windows
   not read alone yet go first, the most overdue first, then the gap that began first;
   then the one read alone least recently. A kept window whose last write a backend
-  refused, more than a day after the last re-read time, counts as not read alone yet if
-  its gap has a next window: its next failed call gives it up, and its gap goes on from
-  there. A gap's next window after one that was left has not been read alone yet, so
-  gaps whose windows all fail, such as gaps that reach beyond a bucket's retention (see
-  "Limits"), are crawled through one after another: one window per pause of the reads
-  alone (up to an hour), one per two pauses while a window that takes every other read
-  is due. The windows that wait get their calls later. That costs nothing while the
-  cloud and the bucket still hold their history, except for a window read for the last
-  time whose last write a backend refused: it waits too, and the tries of its last day
-  go by; after that day, one failed call gives it up. With a bucket retention, history
-  can age out meanwhile (see "Limits").
+  refused, more than a day after the last re-read time (or with one try left), counts as
+  not read alone yet if its gap has a next window: its next refused call gives it up,
+  and its gap goes on from there. A gap's next window after one that was left has not
+  been read alone yet, so gaps whose windows all fail, such as gaps whose records a
+  backend keeps refusing, are crawled through one after another: one window per pause of
+  the reads alone (up to an hour), one per two pauses while a window that takes every
+  other read is due. The windows that wait get their calls later. That costs nothing
+  while the cloud and the bucket still hold their history - waiting uses none of a gap's
+  tries - except for a window read for the last time whose last write a backend refused:
+  it waits too, and after the day past the last re-read time one refused call gives it
+  up. With a bucket retention, history can age out meanwhile (see "Limits").
 - An answer cut off by `-q`/`--qlimit` is read again in smaller windows; one cut off even
   in 30-minute windows counts as a failed call.
 
@@ -358,9 +448,9 @@ are merged into one, so none is dropped.
 `RECHECK_GAPS = 0` (or `off`, `no`, `none`, `false`, empty) turns the re-checks off: the
 daemon then behaves exactly as without them, and `state.json` gets no new key. Legacy
 config files (`~/.sensorpush.conf`, `~/.sensorpush_vm.conf`) may have a `[DAEMON]`
-section for this; `RECHECK_GAPS` and `RECHECK_MIN_GAP` are the only keys read from it. An
-invalid value stops the daemon at startup with a one-line error. One-shot runs ignore
-both keys.
+section for this; `RECHECK_GAPS`, `RECHECK_MIN_GAP` and `RECHECK_GIVE_UP_AFTER` are the
+only keys read from it. An invalid value stops the daemon at startup with a one-line
+error. One-shot runs ignore all three keys.
 
 Limits:
 
@@ -368,46 +458,67 @@ Limits:
   fetched; a one-shot run with `-s`/`-p` still gets them.
 - **On-board storage.** Sensors keep about 20 days (HT1), 30 days (HTP.xw) or 45 days
   (HT.w) of samples; older parts of a longer gap are not re-read.
-- **Bucket retention.** InfluxDB 2 refuses a write that holds any point older than the
-  bucket's retention (HTTP 422), so every re-read of a window that reaches beyond it
-  fails. The re-reads get through such windows one failed call each. Each moves a gap on
-  by one window, `-t` minus 60 minutes of data (11 hours at the default `-t 720`), while
-  the retention boundary moves an hour per hour. History that ages out of the bucket
-  meanwhile is lost, also that of the gaps that wait behind such a crawl. Measured on 18
-  sensors (12 HT1, 2 HTP.xw, 4 HT.w), of the samples the bucket would still take when
-  they came back: at `-t 720`, 91 % written after a 15-day outage with a 14-day bucket,
-  42 % after a 10-day outage with a 7-day bucket; after the 15-day outage 48 % at `-t
-  360`, 14 % at `-t 180`, and nothing at `-t 120` or less, where the re-reads never
-  catch up. After a 21-day outage with a 14-day bucket, the 6 HT.w and HTP.xw gaps waited
-  behind the 12 HT1 crawls, and only 150 of the 120,750 of their samples the bucket
-  would take were written. A bucket that keeps longer than the longest outage plus 7
-  days and an hour avoids all of this.
+- **Bucket retention.** InfluxDB 2 stores the points of a write that are inside the
+  bucket's retention and drops the older ones, answering HTTP 422 ("partial write: points
+  beyond retention policy dropped=N"). The daemon counts such a write as done - one
+  WARNING the first time, INFO lines after it - so the polls, back-fills and re-reads of
+  a gap that reaches beyond the retention go on at their usual pace, but nothing older
+  than the bucket keeps is stored, and history that ages out of the bucket before its
+  re-read is lost. A bucket that keeps longer than the longest outage plus 7 days and an
+  hour avoids that. VictoriaMetrics drops samples outside its retention without an
+  error. A write a backend refuses for another reason (any other InfluxDB 2 error, a
+  field type conflict say, or an InfluxDB 3 error, also for points older than it keeps)
+  still fails: the re-reads get through windows a backend keeps refusing one failed call
+  each - on a gap's last re-read from a day after its time on - one window per pause of
+  the reads alone (up to an hour), and history that ages out of a bucket meanwhile is
+  lost, also that of the gaps that wait behind such a crawl.
 - **Short buckets.** A re-read writes only when it finds more samples than the reads
   before it, and it writes from an hour before the gap. With a bucket that keeps less than
   the last re-read time plus the gap and an hour (with the default `RECHECK_GAPS`, any
   bucket of 7 days or less), a last re-read that finds new samples - history uploaded
-  after the 3d read, say - is refused: its write holds points older than the bucket keeps.
-  Such a gap of 2 hours costs 29 failed calls over its last re-read and the day after it,
-  at an `INTERVAL` of 5 minutes, each with one INFO, one WARNING and three ERROR lines,
-  and is then given up. A gap whose history came by the 3d read costs nothing more: its
-  last re-read finds nothing new and writes nothing. Set `RECHECK_GAPS` to times inside
-  the retention, e.g. `1h, 6h, 1d, 3d` for a 7-day bucket.
+  after the 3d read, say - writes points older than the bucket keeps. InfluxDB 2 drops
+  those and stores the rest, so that call costs nothing more; with a bucket of 7 days or
+  less (the default `RECHECK_GAPS`) the rest is none of the gap. A gap whose history
+  came by the 3d read costs nothing at all: its last re-read finds nothing new and writes
+  nothing. At startup the daemon reads the bucket's retention, and if it is at or below
+  the last `RECHECK_GAPS` time, it logs a WARNING with the times to set (a token without
+  read access to buckets only skips the check). Set `RECHECK_GAPS` to times inside the
+  retention, e.g. `1h, 6h, 1d, 3d` for a 7-day bucket.
 - **A write refused for a moment.** A window read for the last time whose write a backend
   refused only for a moment (during a restart, say) loses its turn while other windows
-  are read alone, such as those of a gap crawling through windows a bucket refuses: it
-  waits with them, and the tries of its last day go by. It is lost if its single call
-  after that day fails, or if, with a bucket retention, its history ages out while other
-  gaps' windows go first. Measured: while the gap of a 30-day outage was crawled through
-  with a 14-day bucket, a 2-hour gap whose last re-read a backend refused for 2 hours got
-  its next call only 40 hours after its last re-read time.
-- **Re-read calls failing for more than a day.** A gap's last re-read gives up a window
-  that still fails more than a day after the last re-read time (see above). So when
-  SensorPush answers the polls but fails the re-read calls for more than a day, a gap
-  whose last re-read time came more than a day before that spell ends can lose the history
-  only that re-read would write; which of these gaps lose depends on when their calls
-  come. While the polls fail too, re-reads make no calls and give up nothing. Measured: 12
-  HT1 gaps at their last re-read during a 27-hour spell of failing re-read calls, 86 to
-  97 % of that history written.
+  are read alone, such as those of a gap crawling through windows a backend keeps
+  refusing: it waits with them. It is lost if its next call more than a day after its
+  last re-read time is refused again (one that fails at the API keeps it), or if, with a
+  bucket retention, its history ages out while other gaps' windows go first. Measured
+  with a backend that refused every point older than 14 days, while the gap of a 30-day
+  outage was crawled through: a 2-hour gap whose last re-read a backend refused for 2
+  hours got its next call only 40 hours after its last re-read time.
+- **Re-read calls failing for days.** A gap's last re-read is given up by its 48th
+  failed call in a row (`RECHECK_GIVE_UP_AFTER`, see above). While SensorPush answers the
+  polls but fails the re-read calls, the windows read alone share one pause, which grows
+  to an hour, so one gap outlasts nearly two days of such a spell, several gaps longer;
+  history is lost only when the spell outlasts a gap's tries. While the polls fail too,
+  re-reads make no calls and use no tries. Calls that fail now and then do not add up: a
+  read that works starts the count over (simulated: the last re-read of a 21-day gap
+  whose calls failed at random, 3 to 6 in 10 of them, and of a 40-day gap, 3 or 4 in 10,
+  wrote all of the history in each of 120 runs). A window whose records a backend keeps
+  refusing is given up by a refused call more than a day after the last re-read time
+  (see above). Measured: 4 to 12 HT1 gaps at their last re-read during spells of 24 to
+  30 hours of failing re-read calls, also with another gap crawling meanwhile and with
+  restarts, and the 18 sensors of one 30-hour outage at their last re-read during spells
+  of up to 36 hours: all of that history written in each of 85 runs (the previous rule,
+  which gave a window up by its first failed call a day after the last re-read time: 19
+  to 100 %, 87 % in all).
+- **Windows that never work, beside a crawl.** A window read for the last time whose calls
+  keep failing at the API takes every other read alone until its gap's tries are used up
+  (`RECHECK_GIVE_UP_AFTER`, nearly two days for one gap), where the previous rule gave it
+  up a day after the last re-read time. Meanwhile another gap that crawls through windows a
+  backend refuses goes at half speed, and with a bucket retention more of its history can
+  age out first. This needs a backend that refuses old points: InfluxDB 2 no longer does
+  (see "Bucket retention"), VictoriaMetrics never did. Measured with a backend that refused
+  every point older than 14 days, beside 4 such windows: in 2 of 21 setups the crawling gap
+  kept 22 and 43 % of its history instead of 63 % (all 21: 63.1 % instead of 65.9 %); with
+  InfluxDB 2's behaviour, the same in all 21.
 - **HT1 data not seen live.** HT1 sensors seem to leave a reading out of their own record
   when neither temperature nor humidity has changed, so their own samples can be an hour
   apart. While the daemon polls at most 25 minutes apart it also sees the live copies, at

@@ -7,13 +7,22 @@ Cloud answers get_samples() from the sample times it holds.
 Comments that name a review item (load-r4-4, compat-r2-1, ...) or a round
 (round 3, ...) refer to the reviews of this feature before its first
 release: they say which earlier behaviour a test guards against.
+
+The fake backends that refuse every batch with a point older than some age
+stand for a backend that refuses such writes (InfluxDB 3 with a retention,
+say, or one with a persistent write error).  InfluxDB 2 no longer does: it
+stores what its bucket keeps, and its 422 for the points beyond the
+retention counts as a completed write (see test_retention.py).
 """
 import configparser
 import copy
 import datetime
+import importlib.util
 import json
 import logging
 import re
+import shutil
+import subprocess
 import tempfile
 import time
 import types
@@ -22,7 +31,7 @@ from pathlib import Path
 from unittest import mock
 
 from helpers import (DaemonTestCase, ID_A, ID_B, ID_C, UTC, fake_writer,
-                     make_args, sensorpushd)
+                     make_args, make_config, sensorpushd)
 
 spd = sensorpushd()
 TAG_A, TAG_B = spd.sensor_id_tag(ID_A), spd.sensor_id_tag(ID_B)
@@ -395,8 +404,11 @@ class RecheckConfig(RecheckCase):
         self.assertTrue(d._recheck_on)
         self.assertEqual(d._recheck_offsets, OFFSETS)
         self.assertEqual(d._recheck_min_gap, 20 * M)
+        self.assertEqual(d._recheck_give_up_after, 48)
         self.assertTrue(self.logged(logging.INFO, 'gaps over 20m are read again '
                                                   '1h, 6h, 1d, 3d, 7d after'))
+        self.assertTrue(self.logged(logging.INFO, 'a last re-read is given up after '
+                                                  '48 failed calls'))
         self.assertFalse(self.daemon(Cloud(self.clock, {}),
                                      args=make_args(daemon=False))._recheck_on)
         # Not [DAEMON] defaults: a config without the keys loads as before.
@@ -405,9 +417,10 @@ class RecheckConfig(RecheckCase):
     def test_disable_spellings(self):
         for value in ('', '0', 'off', 'OFF', 'False', 'no', 'None', '  none  '):
             self.assertEqual(spd.parse_recheck_gaps(value), [], repr(value))
-            # RECHECK_MIN_GAP does not matter then, as it did not before.
+            # RECHECK_MIN_GAP does not matter then, as it did not before;
+            # nor does RECHECK_GIVE_UP_AFTER.
             d = self.daemon(Cloud(self.clock, {}), recheck_gaps=value,
-                            recheck_min_gap='junk')
+                            recheck_min_gap='junk', recheck_give_up_after='junk')
             self.assertFalse(d._recheck_on, repr(value))
         self.assertEqual(self.logged(logging.ERROR), [])
 
@@ -416,6 +429,8 @@ class RecheckConfig(RecheckCase):
         invalid = [('recheck_gaps', v) for v in (
             'soon', '1x', '6H', '0h', '-1h', '91d', '3M', '1h,,6h', '1h 6h', '1h,')]
         invalid += [('recheck_min_gap', v) for v in ('abc', '0m', '-5m', '', '20')]
+        invalid += [('recheck_give_up_after', v) for v in ('0', '-1', 'x', '1.5', '',
+                                                           '48 calls', '2d')]
         for key, value in invalid:
             del self.records[:]
             with self.assertRaises(SystemExit) as cm:
@@ -427,9 +442,9 @@ class RecheckConfig(RecheckCase):
             self.assertNotIn('\n', errors[0])
         self.assertEqual(cloud.calls, [])
         self.assertFalse((self.state_dir / 'state.json').exists())
-        # One-shot mode ignores both keys.
+        # One-shot mode ignores all three keys.
         self.daemon(cloud, args=make_args(daemon=False), recheck_gaps='soon',
-                    recheck_min_gap='abc')
+                    recheck_min_gap='abc', recheck_give_up_after='0')
 
     def test_floors_with_one_warning(self):
         for parse, value, expected, floor in (
@@ -465,12 +480,17 @@ class RecheckConfig(RecheckCase):
             self.assertEqual(cfg['daemon']['interval'], 300)
             self.assertFalse(self.daemon(Cloud(self.clock, {}),
                                          **cfg['daemon'])._recheck_on)
+            cfg = load_config(base + '[DAEMON]\nRECHECK_GIVE_UP_AFTER = 12\n')
+            self.assertEqual(cfg['daemon']['recheck_give_up_after'], '12')
+            self.assertEqual(self.daemon(Cloud(self.clock, {}), **cfg['daemon'])
+                             ._recheck_give_up_after, 12)
 
     def test_a_percent_sign_reaches_the_parsers(self):
         # configparser interpolates '%': read that way, '50%' failed loading
         # the whole file, in one-shot mode and --listsensors as well (compat-2).
         for base in (UNIFIED, LEGACY_IFDB2, LEGACY_VM):
-            for key, value in (('RECHECK_GAPS', '1h, 50%'), ('RECHECK_MIN_GAP', '20%')):
+            for key, value in (('RECHECK_GAPS', '1h, 50%'), ('RECHECK_MIN_GAP', '20%'),
+                               ('RECHECK_GIVE_UP_AFTER', '48%')):
                 with self.subTest(key=key, unified=base is UNIFIED):
                     cfg = load_config(base + '[DAEMON]\n%s = %s\n' % (key, value))
                     self.assertEqual(cfg['daemon'][key.lower()], value)
@@ -491,18 +511,51 @@ class RecheckConfig(RecheckCase):
         without = load_config(UNIFIED + '[DAEMON]\nINTERVAL = 300\n')
         self.assertFalse(set(spd.DEFAULT_RECHECK_CFG) & set(without['daemon']))
         cfg = load_config(UNIFIED + '[DAEMON]\nRECHECK_GAPS = 1d, 1h\n'
-                          'RECHECK_MIN_GAP = 25m\n')
+                          'RECHECK_MIN_GAP = 25m\nRECHECK_GIVE_UP_AFTER = 7\n')
         self.assertEqual(cfg['daemon']['recheck_gaps'], '1d, 1h')
         d = self.daemon(Cloud(self.clock, {}), **cfg['daemon'])
-        self.assertEqual((d._recheck_offsets, d._recheck_min_gap), ([H, D], 25 * M))
+        self.assertEqual((d._recheck_offsets, d._recheck_min_gap,
+                          d._recheck_give_up_after), ([H, D], 25 * M, 7))
+        self.assertEqual(spd.parse_recheck_give_up_after(' 1 '), 1)
 
-    def test_template_documents_both_keys_commented_out(self):
+    def test_template_documents_the_keys_commented_out(self):
         self.assertIn('# RECHECK_GAPS = 1h, 6h, 1d, 3d, 7d',
                       spd.DEFAULT_CONFIG_TEMPLATE)
         self.assertIn('# RECHECK_MIN_GAP = 20m', spd.DEFAULT_CONFIG_TEMPLATE)
+        self.assertIn('# RECHECK_GIVE_UP_AFTER = 48', spd.DEFAULT_CONFIG_TEMPLATE)
         parser = configparser.ConfigParser()
         parser.read_string(spd.DEFAULT_CONFIG_TEMPLATE)
         self.assertFalse(parser.has_option('DAEMON', 'RECHECK_GAPS'))
+        self.assertFalse(parser.has_option('DAEMON', 'RECHECK_GIVE_UP_AFTER'))
+
+    def test_a_give_up_count_below_three_still_reads_each_window_three_times(self):
+        # A window is given up where a cell of an earlier pass is skipped:
+        # by its third failed call in a row at the soonest (each later
+        # window, a carry, by its first).  The template says so, and the
+        # startup line names the count as set.
+        self.assertIn('the first one given up still fails 3 times in a row first', ' '.join(
+            l.lstrip('# ') for l in spd.DEFAULT_CONFIG_TEMPLATE.splitlines()))
+        for value, text in (('1', 'given up after 1 failed call in a row'),
+                            ('2', 'given up after 2 failed calls in a row')):
+            with self.subTest(value):
+                self.reset_state()
+                del self.records[:]
+                cloud = Cloud(self.clock, {ID_A: 'HT1'})
+                d = self.daemon(cloud, recheck_give_up_after=value)
+                self.assertTrue(self.logged(logging.INFO, text))
+                t0 = self.clock.t
+                d._register_hole(ID_A, t0 - 7 * D - 2 * H, t0 - 7 * D, cloud.sensors(),
+                                 now=t0 - 7 * D)
+                hole = d._recheck_holes[0]
+                hole['done'] = 4                     # only the 7d read is left
+                cloud.fail = 10 ** 6
+                while hole in d._recheck_holes and self.clock.t < t0 + D:
+                    d._recheck_gaps(cloud.sensors(), 'SensorPush')
+                    self.clock.advance(5 * M)
+                self.assertNotIn(hole, d._recheck_holes)
+                self.assertEqual(len(cloud.sample_calls()), 3)
+                self.assertIn('failed 3 times in a row; its last re-read is given up',
+                              self.logged(logging.WARNING, 'given up')[0])
 
 
 # -----------------------------------------------------------------------------
@@ -1702,9 +1755,9 @@ class ReadingAndWriting(RecheckCase):
                     self.assertEqual([h['done'] for h in d._recheck_holes], [1] * 18)
 
     def test_after_a_skipped_cell_the_next_one_goes_after_the_healthy_holes(self):
-        # A long hole whose records a backend always refuses (older than its
-        # bucket's retention) and a short healthy one, due later.  Once the
-        # first cell is skipped, the next one is likely to fail as well: it
+        # A long hole whose records a backend always refuses (older than it
+        # takes) and a short healthy one, due later.  Once the first cell is
+        # skipped, the next one is likely to fail as well: it
         # starts one failed call short of being skipped, so the healthy
         # hole goes first and is read at once, and the next cell is read
         # alone, after it, and skipped after one more failure (load-r4).
@@ -1723,7 +1776,7 @@ class ReadingAndWriting(RecheckCase):
 
         def write(records):
             if any(r['tags']['sensor_id'] == TAG_A for r in records):
-                raise OSError('422: points beyond retention policy dropped')
+                raise OSError('400: points older than the retention period')
             original(records)
         self.w.write = write
         self.clock.advance(H)
@@ -1769,11 +1822,14 @@ class ReadingAndWriting(RecheckCase):
         self.assertEqual(len(self.logged(logging.WARNING, 'this is its last re-read')), 1)
         self.assertEqual(self.logged(logging.WARNING, 'skipped for this pass'), [])
 
-    def test_the_last_read_is_given_up_a_day_after_it_was_due(self):
+    def test_the_last_read_is_given_up_by_its_48th_failed_call(self):
         # A window that never works - every call fails, or the answer is
         # truncated even in 30-min cells - is tried on the last read, as the
-        # back-off allows, until a day after that read was due; then it is
-        # given up and the hole finished.
+        # back-off allows, until RECHECK_GIVE_UP_AFTER (48) calls have
+        # failed: the 48th gives it up, each later cell (the 3-h hole has 6
+        # of 30 min) is given up by one more, and the hole is finished.
+        # (Round 8 gave it up by its first failed call a day after that read
+        # was due, 20 to 30 calls in.)
         for kind in ('failed', 'truncated'):
             with self.subTest(kind):
                 self.reset_state()
@@ -1790,19 +1846,35 @@ class ReadingAndWriting(RecheckCase):
                     hole['cell'] = 30
                     hole['counts'] = [0] * spd._hole_ncells(hole)
                 self.clock.advance(7 * D)
-                calls = 0
-                while self.clock.t < t0 + 8 * D + 8 * H:
-                    if self.clock.t < t0 + 8 * D:
-                        calls = len(cloud.sample_calls())
-                        self.assertIn(hole, d._recheck_holes)
+                times = []
+                while hole in d._recheck_holes and self.clock.t < t0 + 10 * D:
                     cloud.fail = 10 ** 6 if kind == 'failed' else 0
+                    n0 = len(cloud.sample_calls())
                     d._recheck_gaps(self.sensors, 'SensorPush')
+                    times += [self.clock.t] * (len(cloud.sample_calls()) - n0)
                     self.clock.advance(5 * M)
-                # About one try an hour, once the back-off reached its cap.
-                self.assertTrue(20 <= calls <= 30, calls)
+                cells = spd._hole_ncells(hole)
+                self.assertEqual(cells, 6 if kind == 'truncated' else 1)
+                self.assertEqual(len(times), 48 + cells - 1)
+                self.assertEqual(hole['tries'], 48 + cells - 1)
+                # About one try an hour, once the back-off reached its cap:
+                # the 48th call comes 43 h 15 min after the 7-d time.
+                self.assertEqual(times[47] - (t0 + 7 * D), 43 * H + 15 * M)
                 self.assertEqual((hole['done'], hole['pos']), (5, 0))
                 self.assertEqual(d._recheck_holes, [])
-                self.assertTrue(self.logged(logging.WARNING, 'its last re-read is given up'))
+                kept = self.logged(logging.WARNING, 'this is its last re-read')
+                self.assertEqual(len(kept), 1)
+                # Kept by its third failed call: 45 tries are left.
+                self.assertIn('tried again until it works or 45 more calls have failed '
+                              '(RECHECK_GIVE_UP_AFTER = 48)', kept[0])
+                given_up = self.logged(logging.WARNING, 'its last re-read is given up')
+                self.assertEqual(len(given_up), cells)
+                self.assertIn('failed 48 times in a row; its last re-read is given up after '
+                              '48 failed calls in a row for the gap (RECHECK_GIVE_UP_AFTER = '
+                              '48)', given_up[0])
+                for n, message in enumerate(given_up[1:], 49):
+                    self.assertIn('failed once; its last re-read is given up after %d '
+                                  'failed calls in a row' % n, message)
                 self.assertEqual(len(self.logged(logging.INFO, 're-checks finished')), 1)
 
     def test_a_read_that_is_the_last_after_downtime_keeps_its_cell(self):
@@ -1893,7 +1965,7 @@ class ReadingAndWriting(RecheckCase):
 
     def test_a_failing_last_read_holds_up_no_other_gap(self):
         # The last read of sensor A's gap fails on every call; it is tried on
-        # for a day, and given up by the first call after that.  Sensor B,
+        # for about two days, and given up by its 48th failed call.  Sensor B,
         # an HT.w, has a new gap every 2 hours.  Each failed try of A paused
         # all re-reads - 5 min after each read of B, longer in between - so
         # B's reads waited up to 51 min.  After its 2nd failure A's cell is
@@ -1927,7 +1999,7 @@ class ReadingAndWriting(RecheckCase):
                     waits.append(self.clock.t - (h['closed_at'] + OFFSETS[done]))
             self.clock.advance(5 * M)
         tries = [c for c in cloud.calls if c[1] == 'A']
-        self.assertTrue(20 <= len(tries) <= 30, len(tries))
+        self.assertEqual(len(tries), 48)
         self.assertEqual([h['sid'] for h in d._recheck_holes].count(ID_A), 0)
         self.assertGreater(len(waits), 20)
         self.assertLess(max(waits), 5 * M, max(waits) / 60)
@@ -2117,10 +2189,9 @@ class ReadingAndWriting(RecheckCase):
         self.assertEqual(len(self.logged(logging.INFO, 'is complete (59 samples)')), 1)
 
     def test_a_window_that_always_fails_holds_up_no_other_hole(self):
-        # The backend always refuses one hole's records (say, older than a
-        # bucket's retention).  The other hole is read anyway, and the bad
-        # cell costs RECHECK_CELL_MAX_FAILS calls a pass, then waits for the
-        # next pass.
+        # The backend always refuses one hole's records (say, older than it
+        # takes).  The other hole is read anyway, and the bad cell costs
+        # RECHECK_CELL_MAX_FAILS calls a pass, then waits for the next pass.
         t0 = self.clock.t
         for sid, a in ((ID_A, t0 - 3 * D), (ID_B, t0 - 3 * H)):
             self.cloud.add(sid, every(a - H, a + 2 * H, 5 * M))
@@ -2130,7 +2201,7 @@ class ReadingAndWriting(RecheckCase):
 
         def write(records):
             if any(r['tags']['sensor_id'] == TAG_A for r in records):
-                raise OSError('422: points beyond retention policy dropped')
+                raise OSError('400: points older than the retention period')
             original(records)
         self.w.write = write
         self.clock.advance(H)
@@ -2371,13 +2442,12 @@ class LastPass(RecheckCase):
 class ReadAlone(RecheckCase):
     """Cells read alone: one back-off of their own, their order, regroups."""
 
-    def kept_cells(self, n, b_every=None, c_at=None, days=2):
+    def kept_cells(self, n, b_every=None, c_at=None, days=2, **daemon_cfg):
         """n HT1 gaps of one outage closed 7 days ago; their history came
-        after the 3d read, and the backend refuses it (older than a bucket's
-        7-day retention: 422), so their 7d reads fail for good.  B (HT.w)
-        gets a new gap every ``b_every`` seconds, C (HT.w) one at ``c_at``
-        whose first two calls fail (a 502).  5-min cycles, as many days.
-        Returns the calls, B's waits and C's times."""
+        after the 3d read, and the backend refuses it, so their 7d reads
+        fail for good.  B (HT.w) gets a new gap every ``b_every`` seconds,
+        C (HT.w) one at ``c_at`` whose first two calls fail (a 502).  5-min
+        cycles, as many days.  Returns the calls, B's waits and C's times."""
         a_ids = ['%d.4567890123456789' % (300100 + k) for k in range(n)]
         kinds = dict.fromkeys(a_ids, 'HT1')
         kinds.update({ID_B: 'HT.w', ID_C: 'HT.w'})
@@ -2389,7 +2459,7 @@ class ReadAlone(RecheckCase):
 
         def write(records):
             if any(r['tags']['sensor_id'] in a_tags for r in records):
-                raise OSError('422: points beyond retention policy dropped')
+                raise OSError('400: points older than the retention period')
             real_write(records)
         w.write = write
         c_left = [2]
@@ -2403,7 +2473,7 @@ class ReadAlone(RecheckCase):
                 raise ValueError('API request failed with status 502')
             return real_get(start, stop, measures, limit, sensors)
         cloud.get_samples = get_samples
-        d = self.daemon(cloud, writer=w)
+        d = self.daemon(cloud, writer=w, **daemon_cfg)
         t0 = self.clock.t
         a_end = t0 - 7 * D + 60
         for sid in a_ids:
@@ -2412,8 +2482,8 @@ class ReadAlone(RecheckCase):
             d._recheck_holes[-1]['done'] = 4         # only the 7d read is left
         cloud.add(ID_B, every(t0 - 2 * H, t0 + (days + 1) * D))
         cloud.add(ID_C, every(t0 - 2 * H, t0 + (days + 1) * D))
-        out = {'a_ids': a_ids, 'grace_end': a_end + 7 * D + spd.RECHECK_LAST_PASS_GRACE,
-               'calls': [], 'b_waits': [], 'c_twice': None, 'c_read': None}
+        out = {'a_ids': a_ids, 'calls': [], 'b_waits': [], 'c_twice': None,
+               'c_read': None}
         next_b, c_hole = t0 + 10 * M, None
         while self.clock.t < t0 + days * D:
             w._consecutive_failures = 0              # the cycle's poll landed
@@ -2449,20 +2519,21 @@ class ReadAlone(RecheckCase):
         # 12 kept cells: round 3 gave each one a back-off of its own, so
         # together they made a failing call in nearly every cycle (272 in two
         # days, 816 ERROR lines; compat-r3-1, load-r3-3), and their give-ups
-        # paused every other gap (load-r2-2).
-        run = self.kept_cells(12, b_every=2 * H)
+        # paused every other gap (load-r2-2).  RECHECK_GIVE_UP_AFTER = 5, so
+        # that every cell is given up within the two days.
+        run = self.kept_cells(12, b_every=2 * H, recheck_give_up_after='5')
         a_ids, d = run['a_ids'], run['d']
         a_calls = [(t, s) for t, _, s in run['calls'] if set(s) & set(a_ids)]
-        # The first two calls serve all 12; one call a step after that.
-        self.assertEqual([len(s) for _, s in a_calls[:2]], [12, 12])
-        in_grace = [s for t, s in a_calls if t <= run['grace_end']]
-        self.assertTrue(len(in_grace) <= 32, len(in_grace))
-        self.assertEqual(set(in_grace[2:]), {(sid,) for sid in a_ids})
-        # After the grace end, one more call each, alone, which fails and
-        # gives the cell up.  (Round 4 gave them up at the grace end without
+        # The first two calls serve all 12; one call a step after that, for
+        # one cell: three each, and each gap's third, its 5th failed call,
+        # gives its cell up.  (Round 4 gave them up at the grace end without
         # a call; corr-r4-1.)
-        self.assertEqual(sorted(s for t, s in a_calls if t > run['grace_end']),
-                         sorted((sid,) for sid in a_ids))
+        self.assertEqual([len(s) for _, s in a_calls[:2]], [12, 12])
+        self.assertEqual(sorted(s for _, s in a_calls[2:]),
+                         sorted((sid,) for sid in a_ids for _ in range(3)))
+        self.assertEqual(len({t for t, _ in a_calls}), len(a_calls))
+        # One step of the back-off apart (an hour, once at its cap).
+        self.assertGreater(a_calls[-1][0] - a_calls[2][0], 30 * H)
         self.assertEqual(len(self.logged(logging.WARNING, 'its last re-read is given up')), 12)
         self.assertFalse([h for h in d._recheck_holes if h['sid'] in a_ids])
         # Only the two calls read together paused all re-reads.
@@ -2487,12 +2558,12 @@ class ReadAlone(RecheckCase):
                     if s == (ID_C,) and tag is None)
         self.assertEqual([s for t, _, s in calls[:read] if t >= run['c_twice']], [])
 
-    def test_a_long_last_read_given_up_after_its_grace_holds_up_no_other_gap(self):
+    def test_a_long_last_read_given_up_after_its_tries_holds_up_no_other_gap(self):
         # A 10-day HT1 gap (22 cells) whose 7d read fails in every call, and
-        # B (HT.w) with a new gap every 2 h.  After the grace day each cell
-        # is given up after one call read alone, the kept one too.  Round 3
-        # put those calls on the common back-off: B waited up to 56 min, for
-        # 10 h (load-r2-2).
+        # B (HT.w) with a new gap every 2 h.  The 48th failed call gives up
+        # the first cell, and the crawl goes on: each later cell is given up
+        # after one call read alone.  Round 3 put those calls on the common
+        # back-off: B waited up to 56 min, for 10 h (load-r2-2).
         cloud = Cloud(self.clock, {ID_A: 'HT1', ID_B: 'HT.w'})
         sensors = cloud.sensors()
         real_get = cloud.get_samples
@@ -2512,7 +2583,6 @@ class ReadAlone(RecheckCase):
         hole['done'] = 4                             # only the 7d read is left
         self.assertEqual(spd._hole_ncells(hole), 22)
         cloud.add(ID_B, every(t0 - 2 * H, t0 + 5 * D))
-        grace_end = a_end + 7 * D + spd.RECHECK_LAST_PASS_GRACE
         waits, next_b, gone = [], t0 + 10 * M, None
         while self.clock.t < t0 + 3 * D:
             if self.clock.t >= next_b:
@@ -2529,13 +2599,19 @@ class ReadAlone(RecheckCase):
                 gone = self.clock.t
             self.clock.advance(5 * M)
         self.assertIsNotNone(gone)
-        self.assertLess(gone - grace_end, 23 * H)
-        # In the grace day, one call a step of the back-off; after it, one,
-        # alone, for each of the 22 cells.  (Round 4 gave the kept first
-        # cell up at the grace end without a call: 21; corr-r4-1.)
-        self.assertTrue(20 <= len([t for t in a_calls if t <= grace_end]) <= 30)
-        self.assertEqual(len([t for t in a_calls if t > grace_end]), 22)
-        self.assertEqual(len(self.logged(logging.WARNING, 'its last re-read is given up')), 22)
+        # One call a step of the back-off: 48 for the first cell, the last
+        # of which gives it up, then one, alone, for each of the other 21.
+        # (Round 8: 20 to 30 in the day after the 7d time, then one for each
+        # of the 22 cells; round 4 gave the kept first cell up at the grace
+        # end without a call: 21; corr-r4-1.)
+        self.assertEqual(len(a_calls), 48 + 21)
+        self.assertEqual(hole['tries'], 48 + 21)
+        given_up = self.logged(logging.WARNING, 'its last re-read is given up')
+        self.assertEqual(len(given_up), 22)
+        self.assertIn('failed 48 times in a row', given_up[0])
+        self.assertTrue(all('failed once' in m for m in given_up[1:]))
+        self.assertLess(a_calls[47] - a_calls[0], 44 * H)
+        self.assertLess(gone - a_calls[47], 22 * H)
         self.assertEqual(len(self.logged(logging.WARNING, 'Gap re-reads pause')), 2)
         self.assertGreater(len(waits), 30)
         self.assertLess(max(waits), 5 * M)
@@ -2559,7 +2635,7 @@ class ReadAlone(RecheckCase):
 
             def write(records):
                 if any(r['tags']['sensor_id'] == bad for r in records):
-                    raise OSError('422: points beyond retention policy dropped')
+                    raise OSError('400: points older than the retention period')
                 real_write(records)
             w.write = write
         seen, real_get = [0], cloud.get_samples
@@ -2652,16 +2728,16 @@ class ReadAlone(RecheckCase):
 
     def test_a_gap_that_keeps_failing_takes_turns_with_a_kept_cell(self):
         # corr-r4-1.  A: an HT1 gap of 20 days at its 7d read.  The bucket
-        # keeps 14 days, so its older cells are refused (422) on every call:
-        # its first cell is kept for the grace day, and each later old cell
-        # is a carry, given up after one failed call read alone.  B: a 2-day
-        # HT1 gap that closed 22 h after A; for 3 hours from its 7d read
-        # every re-read call fails, so its first cell is kept too.  Round 4
-        # gave every carry 'never read alone': A's carries took every turn
-        # for 33 h, and B's cell was given up at its grace end without a
-        # call (119 of its 575 samples lost).  Now a kept cell takes every
-        # other call read alone after the others, so A's crawl and B's kept
-        # cell take turns.
+        # keeps 14 days, so its older cells are refused on every call: its
+        # first cell is kept until its gap's 48 tries are used up, and each
+        # later old cell is a carry, given up after one failed call read
+        # alone.  B: a 2-day HT1 gap that closed 22 h after A; for 3 hours
+        # from its 7d read every re-read call fails, so its first cell is
+        # kept too.  Round 4 gave every carry 'never read alone': A's carries
+        # took every turn for 33 h, and B's cell was given up at its grace
+        # end without a call (119 of its 575 samples lost).  Now a kept cell
+        # takes every other call read alone after the others, so A's cells
+        # and B's kept cell take turns.
         cloud = Cloud(self.clock, {ID_A: 'HT1', ID_B: 'HT1'})
         sensors = cloud.sensors()
         t0 = self.clock.t
@@ -2684,7 +2760,7 @@ class ReadAlone(RecheckCase):
         def write(records):
             if any(spd._observed_epoch(r['time']) < self.clock.t - 14 * D
                    for r in records if r['measurement'] == 'SensorPush'):
-                raise OSError('422: points beyond retention policy dropped')
+                raise OSError('400: points older than the retention period')
             real_write(records)
         w.write = write
         d = self.daemon(cloud, writer=w, args=make_args(delay=10))
@@ -2749,7 +2825,7 @@ class ReadAlone(RecheckCase):
 
         def write(records):
             if any(spd._observed_epoch(r['time']) < self.clock.t - 30 * D for r in records):
-                raise OSError('422: points beyond retention policy dropped')
+                raise OSError('400: points older than the retention period')
             real_write(records)
         w.write = write
         d = self.daemon(cloud, writer=w, args=make_args(delay=10))
@@ -2762,8 +2838,7 @@ class ReadAlone(RecheckCase):
         cloud.add(X, every(x_end - 40 * D - 2 * H, t0 + 2 * D, 10 * M))
         d._register_hole(X, x_end - 40 * D, x_end, sensors, now=x_end)
         self.assertEqual(spd._hole_ncells(d._recheck_holes[-1]), 88)
-        grace_end = k_end + 7 * D + spd.RECHECK_LAST_PASS_GRACE
-        while self.clock.t < grace_end + H:
+        while self.clock.t < k_end + 8 * D + H:
             w._consecutive_failures = 0              # the cycle's poll landed
             d._recheck_gaps(sensors, 'SensorPush')
             self.clock.advance(5 * M)
@@ -2780,8 +2855,10 @@ class ReadAlone(RecheckCase):
         # load-r4-2.  X (HT1): a 20-day gap at its 7d read whose cells older
         # than the bucket's 14 days are refused; its grace ends at t0 + 1 d,
         # and from then on each such cell is a carry, given up after one call
-        # read alone.  K (HT.w): a 1-day gap at its 7d read, due at t0 + 26 h;
-        # its first 3 calls fail, so its cell is kept until t0 + 50 h.  C
+        # read alone (a backend still refusing its records after its grace
+        # end, its tries are no reason to keep it).  K (HT.w): a 1-day gap at
+        # its 7d read, due at t0 + 26 h; its first 3 calls fail at the API, so
+        # its cell is kept, with 45 tries left.  C
         # (HT.w): a 1-day gap noted at t0 + 28 h whose first 3 calls fail: its
         # first cell is skipped and the next is a carry.  B (HT.w): a new 1-h
         # gap every 2 h.  Round 4 read X's carries first until t0 + 58 h: K's
@@ -2818,7 +2895,7 @@ class ReadAlone(RecheckCase):
         def write(records):
             if any(spd._observed_epoch(r['time']) < self.clock.t - 14 * D for r in records):
                 calls[-1] = calls[-1][:2] + ('refused',)
-                raise OSError('422: points beyond retention policy dropped')
+                raise OSError('400: points older than the retention period')
             real_write(records)
         w.write = write
         d = self.daemon(cloud, writer=w)
@@ -2863,6 +2940,7 @@ class ReadAlone(RecheckCase):
         self.assertEqual(len(k_failed), 3)
         self.assertLess(times(K, 'read')[0] - k_failed[-1], 2 * H + 5 * M)
         self.assertLess(k_gone, k_grace_end)
+        self.assertNotIn('tries', hole_k)
         self.assertTrue({t for t in cloud.samples[K] if k_end - D < t < k_end} <= written(K))
         self.assertEqual([m for m in self.logged(logging.WARNING, 'given up') if "'S1'" in m], [])
         # C: its carry waits for X's crawl, at most as long as in round 4
@@ -2876,17 +2954,20 @@ class ReadAlone(RecheckCase):
         # its grace end; at most 28 a day, the most round 4 made in a day.
         x_failed = [t for t, s, r in calls if X in s and r != 'read']
         self.assertEqual(len(x_failed), 62)
+        x_given_up = [m for m in self.logged(logging.WARNING, 'given up') if "'S0'" in m]
+        self.assertIn('as a backend still refuses its records after', x_given_up[0])
         self.assertLessEqual(max(len([t for t in x_failed if t0 + k * D <= t < t0 + (k + 1) * D])
                                  for k in range(3)), 28)
         self.assertEqual(len(self.logged(logging.WARNING, 'Gap re-reads pause')), 6)
 
     def test_crawls_through_cells_a_bucket_refuses_go_one_after_another(self):
         # crawl-r5.  12 HT1 sensors were off for 8 days and came back 30 min
-        # ago with their history.  The bucket keeps 7 days and refuses every
-        # batch that holds an older point (422, as influxdb-client raises),
-        # so the oldest cells of every hole fail on every call: each hole
-        # crawls through them, one failed call read alone per cell, on the
-        # alone back-off (about one an hour).  Round 5 had the holes take
+        # ago with their history.  The backend keeps 7 days and refuses
+        # every batch that holds an older point (as InfluxDB 2 did before
+        # its 422 counted as a completed write), so the oldest cells of
+        # every hole fail on every call: each hole crawls through them, one
+        # failed call read alone per cell, on the alone back-off (about one
+        # an hour).  Round 5 had the holes take
         # turns, so each crawl moved two cells a day, slower than the
         # retention boundary: none reached its writable cells, and none of
         # the 24,048 samples the bucket still took at the return was
@@ -2907,7 +2988,7 @@ class ReadAlone(RecheckCase):
         def write(records):
             if any(spd._observed_epoch(r['time']) < self.clock.t - 7 * D
                    for r in records if r['measurement'] == 'SensorPush'):
-                raise OSError('422: points beyond retention policy dropped')
+                raise OSError('400: points older than the retention period')
             real_write(records)
         w.write = write
         d = self.daemon(cloud, writer=w, args=make_args(delay=10))
@@ -2926,6 +3007,60 @@ class ReadAlone(RecheckCase):
                for batch in w.written for r in batch if r['measurement'] == 'SensorPush'}
         wrote = sum((sid, t) in got for sid in kinds for t in writable)
         self.assertGreater(wrote, 0.9 * 24048)
+
+    def test_late_history_behind_refused_first_cells_is_crawled_to(self):
+        # retention_crawl_late.py in small form.  4 HT1 sensors were off for
+        # 8 days; their history reached the cloud after the 3d read, so only
+        # the 7d read can write it, and the backend refuses every batch that
+        # holds a point older than 14 days: each hole's oldest cells are
+        # refused on every call, and its first cell is kept.  A refused call
+        # after its grace end gives it up, and the hole crawls on to the
+        # cells the backend takes, one call read alone per cell.  Kept for
+        # their tries instead - 48 refused calls each, the four sharing one
+        # call an hour - none was given up before the retention had passed
+        # all of the history: none of it was written (the first build with
+        # RECHECK_GIVE_UP_AFTER; with 12 sensors 0 instead of 62 %).
+        kinds = {'%d.1234567890123456' % (510000 + k): 'HT1' for k in range(4)}
+        cloud = Cloud(self.clock, kinds)
+        sensors = cloud.sensors()
+        t0 = self.clock.t
+        back = t0 - 7 * D                            # the 7d reads are due now
+        off = back - 8 * D
+        history = every(off + 5 * M, back - 5 * M, 5 * M)
+        for sid in kinds:
+            cloud.add(sid, every(off - 2 * H, off, 5 * M) + history
+                      + every(back, t0 + 9 * D, 5 * M))
+        w = fake_writer()
+        real_write = w.write
+
+        def write(records):
+            if any(spd._observed_epoch(r['time']) < self.clock.t - 14 * D
+                   for r in records if r['measurement'] == 'SensorPush'):
+                raise OSError('400: points older than the retention period')
+            real_write(records)
+        w.write = write
+        d = self.daemon(cloud, writer=w, args=make_args(delay=10))
+        for sid in kinds:
+            d._register_hole(sid, off, back, sensors, now=back)
+            d._recheck_holes[-1]['done'] = 4         # only the 7d read is left
+        holes = list(d._recheck_holes)
+        while any(h in d._recheck_holes for h in holes) and self.clock.t < t0 + 8 * D:
+            w._consecutive_failures = 0              # the cycle's poll landed
+            d._recheck_gaps(sensors, 'SensorPush')
+            self.clock.advance(5 * M)
+        self.assertFalse(any(h in d._recheck_holes for h in holes))
+        # What the backend still took at the 7d read, an hour inside.
+        writable = [t for t in history if t >= t0 - 14 * D + H]
+        sid_of = {spd.sensor_id_tag(sid): sid for sid in kinds}
+        got = {(sid_of[r['tags']['sensor_id']], spd._observed_epoch(r['time']))
+               for batch in w.written for r in batch if r['measurement'] == 'SensorPush'}
+        wrote = sum((sid, t) in got for sid in kinds for t in writable)
+        self.assertGreater(wrote, 0.6 * len(writable) * len(kinds))
+        # Each first cell: kept, then given up by a refused call after its
+        # grace end, not by its tries.
+        given_up = self.logged(logging.WARNING, 'its last re-read is given up')
+        self.assertEqual(len([m for m in given_up if 'times in a row' in m]), 4)
+        self.assertEqual([m for m in given_up if 'RECHECK_GIVE_UP_AFTER' in m], [])
 
     def test_a_kept_cell_takes_every_other_call_while_a_gap_crawls(self):
         # crawl-r5.  X1 and X2 (HT.w): one gateway, off for 20 days, back 35
@@ -2961,7 +3096,7 @@ class ReadAlone(RecheckCase):
         def write(records):
             if any(spd._observed_epoch(r['time']) < self.clock.t - 14 * D for r in records):
                 calls[-1] = (calls[-1][0], 'refused', calls[-1][2])
-                raise OSError('422: points beyond retention policy dropped')
+                raise OSError('400: points older than the retention period')
             real_write(records)
         w.write = write
         d = self.daemon(cloud, writer=w)
@@ -3010,17 +3145,17 @@ class ReadAlone(RecheckCase):
         self.assertTrue(set(history) <= set(written_times(w)))
 
     def crawl_and_kept(self, x_days, retention, k_due, k_write=None, k_api=None,
-                       until=None, k_len=2 * H):
+                       until=None, k_len=2 * H, **daemon_cfg):
         """X (HT.w): a gateway off for ``x_days`` came back 35 min ago.  The
-        bucket keeps ``retention`` and refuses (422) every batch with an older
-        point, so X's passes crawl through its oldest cells, one failed call
-        read alone per cell.  K (HT.w): a gap of ``k_len`` (2 h) at its 7d
-        read, due ``k_due`` after t0, with its history in the cloud.  Writes
-        with K's records also fail within ``k_write`` (a backend refusing
-        them for a while), and calls with K within ``k_api`` (a 502).  5-min
+        backend refuses every batch with a point older than ``retention``,
+        so X's passes crawl through its oldest cells, one failed call read
+        alone per cell.  K (HT.w): a gap of ``k_len`` (2 h) at its 7d read,
+        due ``k_due`` after t0, with its history in the cloud.  Writes with
+        K's records also fail within ``k_write`` (a backend refusing them
+        for a while), and calls with K within ``k_api`` (a 502).  5-min
         cycles until ``until`` or until K's gap is gone.  Returns the calls
         (time, sensors, outcome, window start, read alone), K's hole,
-        history and grace end."""
+        history, 7d time and grace end."""
         X, K = ID_A, ID_B
         cloud = Cloud(self.clock, {X: 'HT.w', K: 'HT.w'})
         sensors = cloud.sensors()
@@ -3050,11 +3185,11 @@ class ReadAlone(RecheckCase):
             if old or (within(k_write) and any(r['tags']['sensor_id'] == tag_k
                                                for r in records)):
                 calls[-1] = calls[-1][:2] + ('refused',) + calls[-1][3:]
-                raise OSError('422: points beyond retention policy dropped' if old
+                raise OSError('400: points older than the retention period' if old
                               else '503: service unavailable')
             real_write(records)
         w.write = write
-        d = self.daemon(cloud, writer=w, args=make_args(delay=10))
+        d = self.daemon(cloud, writer=w, args=make_args(delay=10), **daemon_cfg)
         real_call = d._recheck_call
 
         def recheck_call(batch, *a, **k):
@@ -3070,13 +3205,14 @@ class ReadAlone(RecheckCase):
         d._register_hole(K, k_end - k_len, k_end, sensors, now=k_end)
         hole_k = d._recheck_holes[-1]
         hole_k['done'] = 4                           # only the 7d read is left
-        grace_end = k_end + 7 * D + spd.RECHECK_LAST_PASS_GRACE
         while hole_k in d._recheck_holes and (until is None or self.clock.t < t0 + until):
             w._consecutive_failures = 0              # the cycle's poll landed
             d._recheck_gaps(sensors, 'SensorPush')
             self.clock.advance(5 * M)
         return {'calls': calls, 'hole_k': hole_k, 'history': history, 'w': w,
-                'grace_end': grace_end, 'd': d, 'X': X, 'K': K}
+                'k_due': k_end + 7 * D,
+                'grace_end': k_end + 7 * D + spd.RECHECK_LAST_PASS_GRACE,
+                'd': d, 'X': X, 'K': K}
 
     def test_a_refused_kept_cell_waits_while_a_gap_crawls(self):
         # load-r6-1.  The bucket keeps 7 days, so K's 7d read is refused
@@ -3088,9 +3224,14 @@ class ReadAlone(RecheckCase):
         # out of the bucket.  Now a cell whose last failed call a backend
         # refused waits with the others: X's crawl keeps every read alone,
         # and K still gets one call after its grace end, which gives it up -
-        # no cell is given up without a call.  K's gap is one cell, so that
-        # call only gives it up: it waits for X's crawl to end also when K
-        # is the more overdue gap (due 3.5 h before X's 1h read).
+        # no cell is given up without a call.  Its tries do not keep it: the
+        # backend will most likely refuse it again, and a gap's crawl towards
+        # the cells it takes must not wait for them (the first build with
+        # RECHECK_GIVE_UP_AFTER kept it for 48 refused calls; with gaps whose
+        # first cells all were, no crawl ever reached the cells that can be
+        # written: see the next tests).  K's gap is one cell, so that call
+        # only gives it up: it waits for X's crawl to end also when K is the
+        # more overdue gap (due 3.5 h before X's 1h read).
         for k_due in (3 * H, -3.5 * H):
             with self.subTest(k_due=k_due):
                 self.reset_state()
@@ -3106,7 +3247,8 @@ class ReadAlone(RecheckCase):
                 self.assertGreater(calls[k_calls[3]][0], run['grace_end'])
                 given_up = self.logged(logging.WARNING, 'its last re-read is given up')
                 self.assertEqual(len(given_up), 1)
-                self.assertIn("'S1' failed 4 times in a row", given_up[0])
+                self.assertIn("'S1' failed 4 times in a row; its last re-read is given up "
+                              "as a backend still refuses its records after", given_up[0])
                 self.assertNotIn(run['hole_k'], run['d']._recheck_holes)
                 # Between K's third and fourth call, every call was X's: its
                 # crawl, one refused call read alone per cell, for more than
@@ -3162,8 +3304,9 @@ class ReadAlone(RecheckCase):
         # read, due now: its oldest cells are refused, so its first cell is
         # kept, refused, and waits with the others for its grace day, while
         # X's gap (30 days, back 35 min ago) crawls through its cells older
-        # than 14 days.  Past its grace end K's next failed call gives it
-        # up, so it counts as never read alone, as the carry that round 4
+        # than 14 days.  Past its grace end K's next refused call gives it
+        # up (its 45 tries left do not keep it), so it counts as never read
+        # alone, as the carry that round 4
         # made of it at the grace end: more overdue than X's crawl, it is
         # given up at once, and K's own crawl goes on, ahead of X's.  Sorted
         # as read alone, it waited until X's crawl ended, while K's history
@@ -3183,7 +3326,8 @@ class ReadAlone(RecheckCase):
         self.assertGreater(calls[k_calls[3]][0], grace_end)
         self.assertLessEqual(calls[k_calls[3]][0] - grace_end, H + 5 * M)
         given_up = self.logged(logging.WARNING, 'its last re-read is given up')
-        self.assertIn("'S1' failed 4 times in a row", given_up[0])
+        self.assertIn("'S1' failed 4 times in a row; its last re-read is given up as a "
+                      "backend still refuses its records after", given_up[0])
         # It came in the middle of X's crawl, and K's crawl followed: only
         # K's calls read alone, until K's first read that works.  X's crawl
         # was not over then: its 1h pass is still under way.
@@ -3194,7 +3338,78 @@ class ReadAlone(RecheckCase):
         self.assertTrue(all(c[1] == (K,) and c[4] for c in crawl))
         self.assertEqual([h['done'] for h in run['d']._recheck_holes if h['sid'] == X], [0])
 
-    def test_past_its_grace_end_a_kept_cell_that_failed_at_the_api_keeps_its_turn(self):
+    def test_on_its_last_try_a_refused_kept_cell_goes_in_its_gaps_turn(self):
+        # load-r6-1.  The bucket keeps 14 days.  K: a 10-day gap at its 7d
+        # read, due now: its oldest cells are refused, so its first cell is
+        # kept, refused, and waits with the others, while X's gap (30 days,
+        # back 35 min ago) crawls through its cells older than 14 days.
+        # RECHECK_GIVE_UP_AFTER = 4: K's cell is kept with one try left, so
+        # its next failed call gives it up, and it counts as never read
+        # alone, as the carry that round 4 made of it at the grace end: more
+        # overdue than X's crawl, it is given up at once, and K's own crawl
+        # goes on, ahead of X's.  Sorted as read alone, it waited until X's
+        # crawl ended, while K's history aged out of the bucket
+        # (parallel_crawl, 12 sensors, 21-day outage: 48.7 % written instead
+        # of 54.2 %).  The same as past the grace end (the test above), here
+        # before it.
+        run = self.crawl_and_kept(30 * D, 14 * D, 0, k_len=10 * D, until=40 * H,
+                                  recheck_give_up_after='4')
+        calls, X, K = run['calls'], run['X'], run['K']
+        k_calls = [i for i, c in enumerate(calls) if K in c[1]]
+        # Twice together, once alone in turn, which kept it: all refused.
+        self.assertEqual([calls[i][2] for i in k_calls[:3]], ['refused'] * 3)
+        self.assertGreater(len(k_calls), 3)
+        # Then X's 1h read began: twice together, once alone in turn, and
+        # its cell was skipped; the next one, a carry, would begin X's
+        # crawl.  K's fourth call came first, refused, and gave it up.
+        between = calls[k_calls[2] + 1:k_calls[3]]
+        self.assertEqual([(c[1], c[4]) for c in between],
+                         [((X,), False), ((X,), False), ((X,), True)])
+        self.assertEqual(calls[k_calls[3]][2], 'refused')
+        given_up = self.logged(logging.WARNING, 'its last re-read is given up')
+        self.assertIn("'S1' failed 4 times in a row", given_up[0])
+        # K's crawl followed: only K's calls read alone, until K's first
+        # read that works.  X's crawl had not begun: its 1h pass is still
+        # under way.
+        k_ok = next(i for i in k_calls if calls[i][2] == 'read')
+        crawl = calls[k_calls[3]:k_ok + 1]
+        self.assertGreater(len(crawl), 3)
+        self.assertTrue(all(c[1] == (K,) and c[4] for c in crawl))
+        self.assertEqual([h['done'] for h in run['d']._recheck_holes if h['sid'] == X], [0])
+
+    def test_only_a_refused_kept_cell_about_to_be_given_up_counts_as_never_read_alone(self):
+        # The detail of the two tests above, on _alone_order: a kept cell
+        # whose next refused call gives it up (one try left, or past its
+        # grace end) counts as never read alone only if a backend refused
+        # its last failed call and its hole has a next cell.  One of the
+        # kept kind - its last call failed at the API - keeps its turn: put
+        # first, its last call would come at once, perhaps while the calls
+        # still fail (load-r7-1).
+        d = self.daemon(Cloud(self.clock, {ID_A: 'HT1'}))
+        t0 = self.clock.t
+        d._register_hole(ID_A, t0 - 7 * D - 20 * H, t0 - 7 * D, {}, now=t0 - 7 * D)
+        hole = d._recheck_holes[0]
+        self.assertEqual(spd._hole_ncells(hole), 2)
+        hole['done'] = 4
+        tried = self.clock.mono - H
+        late = d._grace_end(hole) + 1
+        self.assertEqual(late, t0 + D + 1)
+        for refused, tries, k, now, never in (
+                (True, 47, 0, t0, True), (False, 47, 0, t0, False),
+                (True, 46, 0, t0, False), (True, 47, 1, t0, False),
+                (True, 3, 0, late, True), (False, 3, 0, late, False),
+                (True, 3, 1, late, False), (True, 3, 0, late - 1, False)):
+            with self.subTest(refused=refused, tries=tries, k=k, now=now - t0):
+                hole['tries'] = tries
+                hole['_fail'] = dict(spd.SensorPushDaemon._new_fail(k), n=3, calls=3,
+                                     at=(1, 2), refused=refused, tried=tried,
+                                     turn=False, regroup=False)
+                c, e = spd._hole_cell(hole, k)
+                key = d._alone_order({'hole': hole, 'k': k, 'c': c, 'd': e,
+                                      'due_at': t0}, now)
+                self.assertEqual(key[0], not never)
+
+    def test_a_kept_cell_that_failed_at_the_api_keeps_its_turn(self):
         # load-r7-1.  Four HT1 gaps at their 7d read, due an hour apart from
         # 30 min in, whose late history is in the cloud: G0 of 14 h (2
         # cells), G1 to G3 of 2 h.  Every re-read call fails at the API (a
@@ -3207,8 +3422,8 @@ class ReadAlone(RecheckCase):
         # G0 was given up, then its carry: 69 of the 236 samples were
         # written.  A kept cell whose last call failed at the API keeps its
         # turn, the least recently read alone first: G1 and G2 get their
-        # tries in their grace day, and G0's next call comes after the
-        # spell, and works.
+        # tries, and G0's next call comes after the spell, and works.  (No
+        # gap comes near its 48 tries here; see the next test for one.)
         ids = ['%d.1234567890123456' % (470000 + k) for k in range(4)]
         cloud = Cloud(self.clock, dict.fromkeys(ids, 'HT1'))
         sensors = cloud.sensors()
@@ -3239,9 +3454,11 @@ class ReadAlone(RecheckCase):
             holes.append(d._recheck_holes[-1])
             holes[-1]['done'] = 4                    # only the 7d read is left
         self.assertEqual([spd._hole_ncells(h) for h in holes], [2, 1, 1, 1])
+        peak = [0] * len(holes)
         while any(h in d._recheck_holes for h in holes) and self.clock.t < t0 + 4 * D:
             w._consecutive_failures = 0              # the cycle's poll landed
             d._recheck_gaps(sensors, 'SensorPush')
+            peak = [max(p, h.get('tries', 0)) for p, h in zip(peak, holes)]
             self.clock.advance(5 * M)
         self.assertFalse(any(h in d._recheck_holes for h in holes))
         written = {(r['tags']['sensor_id'], spd._observed_epoch(r['time']))
@@ -3249,13 +3466,209 @@ class ReadAlone(RecheckCase):
         self.assertEqual(len(history), 236)
         self.assertEqual(len(history & written), 236)
         self.assertEqual(self.logged(logging.WARNING, 'given up'), [])
-        # Each gap's last failed call came in its grace day, and its next
-        # call, after the spell, read it.
-        for sid, hole in zip(ids, holes):
-            grace_end = hole['closed_at'] + 7 * D + spd.RECHECK_LAST_PASS_GRACE
+        # Each gap used a few of its tries, one per failed call made for it,
+        # and its next call, after the spell, read it - which started its
+        # count over.
+        for sid, hole, most in zip(ids, holes, peak):
             mine = [(t, r) for t, s, r in calls if sid in s]
-            self.assertLess(max(t for t, r in mine if r == 'failed'), grace_end)
+            self.assertEqual(most, len([r for t, r in mine if r == 'failed']))
+            self.assertLess(most, 15)
+            self.assertNotIn('tries', hole)
             self.assertEqual({r for t, r in mine if t >= spell_end}, {'read'})
+
+    def test_a_spell_of_failing_re_reads_longer_than_a_day_loses_nothing(self):
+        # The polls work, but every re-read call fails at the API (a 502)
+        # for 30 h: six HT1 gaps at their 7d read, due an hour apart from 30
+        # min in, 14 and 2 h long by turns, whose late history is in the
+        # cloud.  Their kept cells share one alone back-off (up to an hour),
+        # so each gap makes a few failed calls in the spell, far fewer than
+        # its 48 tries, and its first call after the spell reads it.  Round 8
+        # gave a cell up by its first failed call a day after its 7d time:
+        # 451 of the 570 samples were written (kept_wait.py, 6 gaps, 30 h).
+        ids = ['%d.1234567890123456' % (480000 + k) for k in range(6)]
+        cloud = Cloud(self.clock, dict.fromkeys(ids, 'HT1'))
+        sensors = cloud.sensors()
+        t0 = self.clock.t
+        spell_end = t0 + 30 * H
+        calls = []                                   # (time, sensors, outcome)
+        real_get = cloud.get_samples
+
+        def get_samples(start, stop, measures=None, limit=0, sensors=None):
+            s = tuple(sensors or ())
+            if self.clock.t < spell_end:
+                calls.append((self.clock.t, s, 'failed'))
+                raise ValueError('API request failed with status 502')
+            calls.append((self.clock.t, s, 'read'))
+            return real_get(start, stop, measures, limit, sensors)
+        cloud.get_samples = get_samples
+        w = fake_writer()
+        d = self.daemon(cloud, writer=w, args=make_args(delay=10, interval=300))
+        history, holes = set(), []
+        for k, sid in enumerate(ids):
+            end = t0 + 30 * M + k * H - 7 * D
+            length = (14 if k % 2 == 0 else 2) * H
+            late = every(end - length + 5 * M, end - 5 * M, 5 * M)
+            history |= {(spd.sensor_id_tag(sid), t) for t in late}
+            cloud.add(sid, every(end - length - 3 * H, end - length, 5 * M) + late
+                      + every(end, t0 + 5 * D, 5 * M))
+            d._register_hole(sid, end - length, end, sensors, now=end)
+            holes.append(d._recheck_holes[-1])
+            holes[-1]['done'] = 4                    # only the 7d read is left
+        most = 0
+        while any(h in d._recheck_holes for h in holes) and self.clock.t < t0 + 4 * D:
+            w._consecutive_failures = 0              # the cycle's poll landed
+            d._recheck_gaps(sensors, 'SensorPush')
+            most = max([most] + [h.get('tries', 0) for h in holes])
+            self.clock.advance(5 * M)
+        self.assertFalse(any(h in d._recheck_holes for h in holes))
+        written = {(r['tags']['sensor_id'], spd._observed_epoch(r['time']))
+                   for batch in w.written for r in batch if r['measurement'] == 'SensorPush'}
+        self.assertEqual(len(history), 570)
+        self.assertEqual(len(history & written), 570)
+        self.assertEqual(self.logged(logging.WARNING, 'given up'), [])
+        self.assertGreater(most, 3)
+        self.assertLess(most, 15)
+        self.assertLess(min(t for t, _, r in calls if r == 'read') - spell_end, H)
+
+    def test_the_48th_failed_call_gives_the_cell_up_and_the_crawl_goes_on(self):
+        # A 3-cell HT1 gap whose 7d read fails on every call: its first cell
+        # is kept and tried until its gap's 48th failed call gives it up;
+        # each later cell, a carry, is given up by its first failed call.
+        # 48 failed calls plus one per remaining cell, then the hole is
+        # finished.
+        cloud = Cloud(self.clock, {ID_A: 'HT1'})
+        d = self.daemon(cloud)
+        t0 = self.clock.t
+        d._register_hole(ID_A, t0 - 7 * D - 28 * H, t0 - 7 * D, cloud.sensors(),
+                         now=t0 - 7 * D)
+        hole = d._recheck_holes[0]
+        hole['done'] = 4                             # only the 7d read is left
+        self.assertEqual(spd._hole_ncells(hole), 3)
+        cloud.fail = 10 ** 6
+        given_up = []
+        while hole in d._recheck_holes and self.clock.t < t0 + 3 * D:
+            d._recheck_gaps(cloud.sensors(), 'SensorPush')
+            if hole['pos'] > len(given_up):
+                given_up.append((len(cloud.sample_calls()), hole['tries']))
+            self.clock.advance(5 * M)
+        self.assertNotIn(hole, d._recheck_holes)
+        self.assertEqual(len(cloud.sample_calls()), 48 + 2)
+        # When the first two cells were given up: by the 48th and 49th call.
+        self.assertEqual(given_up, [(48, 48), (49, 49)])
+        messages = self.logged(logging.WARNING, 'its last re-read is given up')
+        self.assertEqual(len(messages), 3)
+        self.assertIn('failed 48 times in a row', messages[0])
+        self.assertTrue(all('failed once' in m for m in messages[1:]))
+        self.assertEqual(len(self.logged(logging.INFO, 're-checks finished')), 1)
+
+    def test_failed_calls_of_windows_read_since_use_none_of_the_tries(self):
+        # A long gap's last read on a flaky API.  Each window of a 10-day
+        # HT.w gap (22 cells) at its 7d read fails 3 times - twice read
+        # together, once alone, which keeps it - and its next call reads
+        # it: 66 failed calls in all, never more than 3 in a row.  The tries
+        # count the failed calls in a row, and a read that works starts
+        # them over, so the whole history is written.  Counted in all, the
+        # 16th window's third failed call (the 48th) gave it up, and each
+        # later window was given up by its first failed call
+        # (flaky_last_pass.py, a 21-day gap with every call failing at
+        # random by one in two: 96.0 % written, a loss in 11 of 20 runs;
+        # 5f1431e and this rule 100 %).
+        cloud = Cloud(self.clock, {ID_B: 'HT.w'})
+        fails = {}
+        real_get = cloud.get_samples
+
+        def get_samples(start, stop, measures=None, limit=0, sensors=None):
+            fails[start] = fails.get(start, 0) + 1
+            if fails[start] <= 3:
+                raise ValueError('API request failed with status 502')
+            return real_get(start, stop, measures, limit, sensors)
+        cloud.get_samples = get_samples
+        w = fake_writer()
+        d = self.daemon(cloud, writer=w, args=make_args(delay=10, interval=300))
+        t0 = self.clock.t
+        end = t0 - 7 * D
+        history = every(end - 10 * D + 5 * M, end - 5 * M, 5 * M)
+        cloud.add(ID_B, every(end - 10 * D - 3 * H, end - 10 * D, 5 * M) + history
+                  + every(end, t0 + 5 * D, 5 * M))
+        d._register_hole(ID_B, end - 10 * D, end, cloud.sensors(), now=end)
+        hole = d._recheck_holes[0]
+        hole['done'] = 4                             # only the 7d read is left
+        self.assertEqual(spd._hole_ncells(hole), 22)
+        most = 0
+        while hole in d._recheck_holes and self.clock.t < t0 + 3 * D:
+            w._consecutive_failures = 0              # the cycle's poll landed
+            d._recheck_gaps(cloud.sensors(), 'SensorPush')
+            most = max(most, hole.get('tries', 0))
+            self.clock.advance(5 * M)
+        self.assertNotIn(hole, d._recheck_holes)
+        self.assertEqual((len(fails), sum(fails.values())), (22, 22 * 4))
+        self.assertTrue(set(history) <= set(written_times(w)))
+        self.assertEqual(self.logged(logging.WARNING, 'given up'), [])
+        self.assertEqual(most, 3)
+        kept = self.logged(logging.WARNING, 'this is its last re-read')
+        self.assertEqual(len(kept), 22)
+        self.assertTrue(all('until it works or 45 more calls have failed' in m for m in kept))
+
+    def test_a_pass_that_turns_out_not_to_be_the_last_hands_on_no_tries(self):
+        # A 2-h HT1 gap at its 7d read whose window was kept with 47 of its
+        # 48 tries used, when the daemon restarts with a later read:
+        # RECHECK_GAPS = 1h, 6h, 1d, 3d, 7d, 14d.  The 7d read is no longer
+        # the last.  It works, or it fails 3 times and its window is
+        # skipped; either way it ends with the gap still open, and the 14d
+        # read counts its own tries.  Its history reaches the cloud 13 days
+        # after the gap closed, and the first 3 h of the 14d read fail at
+        # the API: the window is kept, and read once the calls work again.
+        # Handed the 7d read's 47 tries, its third failed call gave it up,
+        # and the history was lost (sched_change.py; 5f1431e kept it for a
+        # day).
+        for seven_d in ('works', 'fails'):
+            with self.subTest(seven_d):
+                self.reset_state()
+                del self.records[:]
+                cloud = Cloud(self.clock, {ID_A: 'HT1'})
+                sensors = cloud.sensors()
+                t0 = self.clock.t
+                closed = end = t0 - 7 * D            # the 7d read is due now
+                start = end - 2 * H
+                late = every(start + 5 * M, end - 5 * M, 5 * M)
+                cloud.add(ID_A, every(start - 3 * H, start, 5 * M)
+                          + every(end, t0 + 9 * D, 5 * M))
+                spells = [(closed + 14 * D, closed + 14 * D + 3 * H)]
+                if seven_d == 'fails':
+                    spells.append((t0, t0 + 2 * H))
+                real_get = cloud.get_samples
+
+                def get_samples(start, stop, measures=None, limit=0, sensors=None,
+                                real_get=real_get, spells=spells):
+                    if any(a <= self.clock.t < b for a, b in spells):
+                        raise ValueError('API request failed with status 502')
+                    return real_get(start, stop, measures, limit, sensors)
+                cloud.get_samples = get_samples
+                self.write_state([{'sid': ID_A, 'start': start, 'end': end,
+                                   'closed_at': closed, 'done': 4, 'pos': 0,
+                                   'cell': 660, 'counts': [0], 'probe': None,
+                                   'tries': 47}])
+                w = fake_writer()
+                d = self.daemon(cloud, writer=w, args=make_args(delay=10, interval=300),
+                                recheck_gaps='1h, 6h, 1d, 3d, 7d, 14d')
+                hole = d._recheck_holes[0]
+                self.assertEqual(hole['tries'], 47)
+                while hole in d._recheck_holes and self.clock.t < closed + 16 * D:
+                    if abs(self.clock.t - (closed + 13 * D)) < 1:
+                        cloud.add(ID_A, late)
+                    w._consecutive_failures = 0      # the cycle's poll landed
+                    d._recheck_gaps(sensors, 'SensorPush')
+                    if self.clock.t < closed + 8 * D:
+                        self.assertEqual(hole['done'], 4 if 'tries' in hole else 5)
+                    self.clock.advance(5 * M)
+                self.assertNotIn(hole, d._recheck_holes)
+                self.assertTrue(set(late) <= set(written_times(w)))
+                self.assertEqual(self.logged(logging.WARNING, 'given up'), [])
+                self.assertEqual(len(self.logged(logging.WARNING, 'skipped for this pass')),
+                                 1 if seven_d == 'fails' else 0)
+                kept = self.logged(logging.WARNING, 'this is its last re-read')
+                self.assertEqual(len(kept), 1)
+                self.assertIn('until it works or 45 more calls have failed', kept[0])
 
     def test_a_window_demoted_on_its_last_read_gets_its_tries_while_a_gap_crawls(self):
         # corr-r6-1.  X (HT.w): a gateway off for 13 days came back 35 min
@@ -3265,20 +3678,21 @@ class ReadAlone(RecheckCase):
         # 7d read, due 2 h in, whose late history is in the cloud.  From 10
         # min before that read until 3 h after it every call with C or D
         # fails (a 502): their batch fails twice, C's read alone fails and
-        # keeps C's cell, and D's window is no longer in turn.  From D's
-        # grace end on, every call with D fails for a day.  Round 6 sorted
-        # D's window with the carries: behind X's crawl it got no try in its
-        # grace day, and its single call, after the grace end, failed: all of
-        # D's history was lost.  A window demoted on its last pass is its
-        # cell's last read, like a kept cell, so it takes the kept turns.
+        # keeps C's cell, and D's window is no longer in turn.  From a day
+        # after the 7d time on (round 8's grace end), every call with D fails
+        # for a day.  Round 6 sorted D's window with the carries: behind X's
+        # crawl it got no try in its grace day, and its single call, after
+        # the grace end, failed: all of D's history was lost.  A window
+        # demoted on its last pass is its cell's last read, like a kept
+        # cell, so it takes the kept turns, and is read within that day.
         X, C, Dd = ID_A, ID_B, ID_C
         cloud = Cloud(self.clock, {X: 'HT.w', C: 'HT1', Dd: 'HT1'})
         sensors = cloud.sensors()
         t0 = self.clock.t
         x_end, cd_end = t0 - 35 * M, t0 + 2 * H - 7 * D
         spell1 = (cd_end + 7 * D - 10 * M, cd_end + 7 * D + 3 * H)
-        grace_end = cd_end + 7 * D + spd.RECHECK_LAST_PASS_GRACE
-        spell2 = (grace_end, grace_end + D)
+        day_after = cd_end + 8 * D
+        spell2 = (day_after, day_after + D)
         calls = []                                   # (time, sensors, outcome)
         real_get = cloud.get_samples
 
@@ -3297,7 +3711,7 @@ class ReadAlone(RecheckCase):
 
         def write(records):
             if any(r['tags']['sensor_id'] == tag_x for r in records):
-                raise OSError('422: points beyond retention policy dropped')
+                raise OSError('400: points older than the retention period')
             real_write(records)
         w.write = write
         d = self.daemon(cloud, writer=w, args=make_args(delay=10))
@@ -3326,22 +3740,22 @@ class ReadAlone(RecheckCase):
                     spd._observed_epoch(r['time']))
         for sid in (C, Dd):
             self.assertTrue(set(history[sid]) <= got[spd.sensor_id_tag(sid)])
-        # D: twice together in spell 1, then read alone in its grace day;
-        # X's crawl went on meanwhile.
+        # D: twice together in spell 1, then read alone within a day of its
+        # 7d time; X's crawl went on meanwhile.
         d_calls = [(t, s, r) for t, s, r in calls if Dd in s]
         self.assertEqual([len(s) for _, s, _ in d_calls[:2]], [2, 2])
         self.assertEqual(d_calls[2][1], (Dd,))
         self.assertLess(d_calls[2][0], spell1[1])
-        self.assertLess(d_calls[-1][0], grace_end)
+        self.assertLess(d_calls[-1][0], day_after)
         self.assertEqual(d_calls[-1][2], 'read')
         self.assertGreater(len([c for c in calls if c[1] == (X,) and c[0] < d_calls[-1][0]]), 3)
 
-    def test_a_kept_cell_past_its_grace_end_gets_one_more_call(self):
-        # corr-r4-1.  A kept cell is given up only by a call that fails after
-        # its grace end, never by the clock alone.  Round 4 gave it up at its
-        # grace end without a call, however long ago it was last tried.  Here
-        # an HT1 gap's 7d read fails until its grace end; the first call after
-        # it fails (the cell is given up) or works (its history is written).
+    def test_a_kept_cell_on_its_last_try_gets_that_call(self):
+        # corr-r4-1.  A kept cell is given up only by a call that fails,
+        # never by the clock.  Round 4 gave it up at its grace end without a
+        # call, however long ago it was last tried.  Here an HT1 gap's 7d
+        # read fails its first 47 calls; its 48th fails (the cell is given
+        # up) or works (its history is written).
         for works in (False, True):
             with self.subTest(works=works):
                 self.reset_state()
@@ -3355,22 +3769,20 @@ class ReadAlone(RecheckCase):
                 cloud.add(ID_A, every(a - H, a, 5 * M) + history + every(b, t0 + 3 * D, 5 * M))
                 d._register_hole(ID_A, a, b, cloud.sensors(), now=b)
                 d._recheck_holes[0]['done'] = 4      # only the 7d read is left
-                grace_end = b + 7 * D + spd.RECHECK_LAST_PASS_GRACE
                 calls = []
                 real_get = cloud.get_samples
 
                 def get_samples(start, stop, measures=None, limit=0, sensors=None,
-                                calls=calls, real_get=real_get, grace_end=grace_end,
-                                works=works):
+                                calls=calls, real_get=real_get, works=works):
                     calls.append(self.clock.t)
-                    if self.clock.t < grace_end or not works:
+                    if len(calls) < 48 or not works:
                         raise ValueError('API request failed with status 500')
                     return real_get(start, stop, measures, limit, sensors)
                 cloud.get_samples = get_samples
-                while self.clock.t < grace_end + 3 * H:
+                while d._recheck_holes and self.clock.t < t0 + 3 * D:
                     d._recheck_gaps(cloud.sensors(), 'SensorPush')
                     self.clock.advance(5 * M)
-                self.assertEqual(len([t for t in calls if t > grace_end]), 1)
+                self.assertEqual(len(calls), 48)
                 self.assertEqual(d._recheck_holes, [])
                 given_up = self.logged(logging.WARNING, 'its last re-read is given up')
                 if works:
@@ -3541,8 +3953,8 @@ class TwoBackends(RecheckCase):
     def test_the_wait_says_what_each_backend_did(self):
         # docs-r5.  The WARNING said re-reads wait 'until every backend takes
         # writes again', also after a single write that a backend refused
-        # (a 422 for points beyond a bucket's retention) while it took every
-        # other one.  It now names, per backend, what was seen; so does the
+        # (an InfluxDB 2 422 for a field type conflict, say) while it took
+        # every other one.  It now names, per backend, what was seen; so does the
         # DEBUG line while only reads of what the polls may have missed wait.
         self.wa._consecutive_failures = 1
         self.wb._connected = False
@@ -3652,6 +4064,127 @@ class State(RecheckCase):
         self.assertEqual([{k: h[k] for k in spd.HOLE_KEYS} for h in again._recheck_holes],
                          [{k: h[k] for k in spd.HOLE_KEYS} for h in d._recheck_holes])
         self.assertTrue(self.logged(logging.INFO, 'Restored 2 gap(s) to re-check'))
+
+    def last_pass_hole(self, cloud, d):
+        """An HT1 gap at its 7d read whose calls all fail (cloud.fail)."""
+        t0 = self.clock.t
+        d._register_hole(ID_A, t0 - 7 * D - 3 * H, t0 - 7 * D, cloud.sensors(),
+                         now=t0 - 7 * D)
+        hole = d._recheck_holes[0]
+        hole['done'] = 4                             # only the 7d read is left
+        cloud.fail = 10 ** 6
+        return hole
+
+    def test_the_tries_survive_a_restart(self):
+        # A restart grants no fresh tries: the count is saved, and the
+        # gap's 48th failed call in a row gives its cell up.  The failure
+        # record of the cell is not saved, so after the restart it is kept
+        # again by its third failed call (one more WARNING, which names the
+        # tries left, not the 48), and the give-up says why it came after
+        # only 8 calls in this process.
+        cloud = Cloud(self.clock, {ID_A: 'HT1'})
+        d = self.daemon(cloud)
+        hole = self.last_pass_hole(cloud, d)
+        while len(cloud.sample_calls()) < 40 and self.clock.t < T0 + 3 * D:
+            d._recheck_gaps(cloud.sensors(), 'SensorPush')
+            self.clock.advance(5 * M)
+        self.assertEqual(hole['tries'], 40)
+        d._save_state()
+        saved = json.loads((self.state_dir / 'state.json').read_text())
+        self.assertEqual(saved['rechecks']['holes'][0]['tries'], 40)
+        self.assertEqual(list(saved['rechecks']['holes'][0]),
+                         list(spd.HOLE_KEYS) + ['tries'])
+        d = self.daemon(cloud)
+        restored = d._recheck_holes[0]
+        self.assertEqual(restored['tries'], 40)
+        while restored in d._recheck_holes and self.clock.t < T0 + 3 * D:
+            d._recheck_gaps(cloud.sensors(), 'SensorPush')
+            self.clock.advance(5 * M)
+        self.assertNotIn(restored, d._recheck_holes)
+        self.assertEqual(len(cloud.sample_calls()), 48)
+        kept = self.logged(logging.WARNING, 'this is its last re-read')
+        self.assertEqual(len(kept), 2)
+        self.assertIn('until it works or 45 more calls have failed', kept[0])
+        self.assertIn('failed 3 times in a row; this is its last re-read, so it is tried '
+                      'again until it works or 5 more calls have failed '
+                      '(RECHECK_GIVE_UP_AFTER = 48)', kept[1])
+        given_up = self.logged(logging.WARNING, 'its last re-read is given up')
+        self.assertEqual(len(given_up), 1)
+        self.assertIn('failed 8 times in a row; its last re-read is given up after 48 failed '
+                      'calls in a row for the gap (RECHECK_GIVE_UP_AFTER = 48)', given_up[0])
+
+    def test_tries_missing_or_invalid_count_as_none(self):
+        # State without the key (5f1431e and older) and values this release
+        # never writes: no tries used, and the hole is kept as it is.
+        t0 = self.clock.t
+        base = {'sid': ID_A, 'start': t0 - 4 * H, 'end': t0 - 3 * H,
+                'closed_at': t0 - 7 * D, 'done': 4, 'pos': 0, 'cell': 660,
+                'counts': [0]}
+        values = [None, 0, -1, 2.5, True, '7', [7], 7]
+        holes = [dict(base)] + [dict(base, tries=v) for v in values]
+        self.write_state(holes)
+        d = self.daemon(Cloud(self.clock, {ID_A: 'HT1'}))
+        self.assertEqual(len(d._recheck_holes), len(holes))
+        self.assertEqual([h.get('tries', 0) for h in d._recheck_holes],
+                         [0] * (len(holes) - 1) + [7])
+        self.assertEqual([d._tries_left(h) for h in d._recheck_holes],
+                         [48] * (len(holes) - 1) + [41])
+        self.assertEqual(self.logged(logging.WARNING, 'malformed'), [])
+        d._save_state()
+        saved = json.loads((self.state_dir / 'state.json').read_text())['rechecks']['holes']
+        self.assertEqual(['tries' in h for h in saved], [False] * (len(holes) - 1) + [True])
+
+    def test_failed_calls_before_the_last_pass_use_no_tries(self):
+        # The 6h read is not the last: its failed calls skip the cell, as
+        # before, and the hole keeps all its tries for the 7d read.
+        cloud = Cloud(self.clock, {ID_A: 'HT1'})
+        d = self.daemon(cloud)
+        t0 = self.clock.t
+        d._register_hole(ID_A, t0 - 7 * H, t0 - 6 * H, cloud.sensors(), now=t0 - 6 * H)
+        hole = d._recheck_holes[0]
+        hole['done'] = 1                             # the 6h read is due
+        cloud.fail = 3
+        for _ in range(6):
+            d._recheck_gaps(cloud.sensors(), 'SensorPush')
+            self.clock.advance(5 * M)
+        self.assertEqual(len(self.logged(logging.WARNING, 'skipped for this pass')), 1)
+        self.assertEqual((hole['done'], hole.get('tries')), (2, None))
+
+    @unittest.skipUnless(shutil.which('git'), 'git is not installed')
+    def test_holes_with_tries_load_in_5f1431e(self):
+        # The release before this key: its _checked_hole copies the keys it
+        # knows, so it loads the holes as they are and drops the count.
+        try:
+            source = subprocess.run(
+                ['git', '-C', str(Path(spd.__file__).parent), 'show',
+                 '5f1431e:sensorpushd.py'], capture_output=True, check=True).stdout
+        except (OSError, subprocess.CalledProcessError):
+            self.skipTest('5f1431e is not in this checkout')
+        cloud = Cloud(self.clock, {ID_A: 'HT1'})
+        d = self.daemon(cloud)
+        hole = self.last_pass_hole(cloud, d)
+        for _ in range(6):
+            d._recheck_gaps(cloud.sensors(), 'SensorPush')
+            self.clock.advance(5 * M)
+        self.assertEqual(hole['tries'], len(cloud.sample_calls()))
+        self.assertEqual(hole['tries'], 4)
+        d._save_state()
+        saved = json.loads((self.state_dir / 'state.json').read_text())
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'sensorpushd_5f1431e.py'
+            path.write_bytes(source)
+            spec = importlib.util.spec_from_file_location('sensorpushd_5f1431e', path)
+            old = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(old)
+        self.assertFalse(hasattr(old, 'parse_recheck_give_up_after'))
+        del self.records[:]
+        od = old.SensorPushDaemon(cloud, [fake_writer()], make_config(), make_args())
+        self.assertEqual([{k: h[k] for k in spd.HOLE_KEYS} for h in od._recheck_holes],
+                         [{k: v for k, v in h.items() if k != 'tries'}
+                          for h in saved['rechecks']['holes']])
+        self.assertNotIn('tries', od._recheck_holes[0])
+        self.assertEqual(self.logged(logging.WARNING, 'malformed'), [])
+        self.assertTrue(self.logged(logging.INFO, 'Restored 1 gap(s) to re-check'))
 
     def test_state_files_of_earlier_releases_load(self):
         cloud = Cloud(self.clock, {ID_A: 'HT1'})
